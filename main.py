@@ -6,6 +6,7 @@ AstrBot Twitter 推文转发插件
   /推特关注 <推主id> [r18] [媒体]          - 订阅推主
   /推特批量关注 <推主id1> <推主id2> ... [r18] [媒体]  - 批量订阅推主
   /推特取关 <推主id>                        - 取关推主
+  /推特批量取关 <推主id1> <推主id2> ...     - 批量取关推主
   /推特清空订阅                             - 清空所有订阅（仅管理员）
   /推特列表                                 - 查看当前订阅列表
   /推特推送 开启/关闭                       - 开启/关闭推送
@@ -953,6 +954,52 @@ class TwitterPlugin(Star):
 
         await self._save_subs(subs)
         yield event.plain_result(f"已取关 {username}")
+
+    @filter.command("推特批量取关", alias={"twitter_batch_unfollow"})
+    async def batch_unfollow_twitter(self, event: AstrMessageEvent):
+        """批量取关推主，格式: /推特批量取关 <推主id1> <推主id2> ..."""
+        msg_str = event.message_str.strip()
+        tokens = msg_str.split()[1:]  # 跳过指令名
+        if not tokens:
+            yield event.plain_result(
+                "请提供推主ID，用法: /推特批量取关 <推主ID1> <推主ID2> ..."
+            )
+            return
+
+        usernames = [t.strip("@").strip() for t in tokens]
+        umo = event.unified_msg_origin
+        subs = await self._get_subs()
+
+        results: list[str] = []
+        success_count = 0
+
+        for username in usernames:
+            if username not in subs:
+                results.append(f"❌ @{username} - 未订阅此推主")
+                continue
+
+            if umo not in subs[username].get("subscribers", {}):
+                results.append(f"❌ @{username} - 当前会话未订阅")
+                continue
+
+            subs[username]["subscribers"].pop(umo)
+
+            # 如果该推主没有任何订阅者了，删除该推主
+            if not subs[username].get("subscribers", {}):
+                subs.pop(username)
+
+            success_count += 1
+            results.append(f"✅ @{username} - 已取关")
+
+        # 一次性保存所有变更
+        await self._save_subs(subs)
+
+        # 汇总结果
+        summary = (
+            f"批量取关完成: 成功 {success_count}/{len(usernames)}\n"
+            + "\n".join(results)
+        )
+        yield event.plain_result(summary)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("推特清空订阅", alias={"twitter_clear_all"})

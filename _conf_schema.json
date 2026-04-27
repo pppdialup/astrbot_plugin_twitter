@@ -1,8 +1,8 @@
 {
   "twitter_nitter_url": {
-    "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
+    "description": "Nitter 镜像站地址（留空则使用内置列表自动选择），强烈建议本地部署Nitter！",
     "type": "string",
-    "hint": "例如: https://nitter.poast.org，留空自动检测可用镜像",
+    "hint": "例如: https://nitter.net，留空自动检测可用镜像",
     "default": ""
   },
   "twitter_proxy": {

@@ -12,12 +12,7 @@ from astrbot.api import logger
 
 # 内置 Nitter 镜像站列表
 WEBSITE_LIST = [
-    "https://xcancel.com",
-    "https://nitter.poast.org",
-    "https://nitter.privacyredirect.com",
     "https://nitter.net",
-    "https://nitter.catsarch.com",
-    "https://nitter.tiekoetter.com"
 ]
 
 

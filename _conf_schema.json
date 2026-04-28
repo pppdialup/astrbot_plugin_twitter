@@ -57,6 +57,12 @@
     "type": "bool",
     "default": false
   },
+  "twitter_link_recognition_enabled": {
+    "description": "推文链接识别全局开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后，聊天中出现 twitter.com / x.com 链接时不再自动解析推文内容"
+  },
   "plugin_enabled": {
     "description": "插件总开关",
     "type": "bool",

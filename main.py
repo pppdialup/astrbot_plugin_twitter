@@ -10,7 +10,6 @@ AstrBot Twitter 推文转发插件
   /推特清空订阅                             - 清空所有订阅（仅管理员）
   /推特列表                                 - 查看当前订阅列表
   /推特推送 开启/关闭                       - 开启/关闭推送
-  /推特链接识别 开启/关闭                   - 开启/关闭链接识别(群聊)
   /推特测试 <推主id>                        - 立即获取并推送指定推主最新一条推文
 
 配置项:
@@ -40,7 +39,6 @@ TWITTER_LINK_PATTERN = re.compile(
 
 # KV 存储键名
 KV_SUBS_KEY = "twitter_subs"
-KV_LINK_CONFIG_KEY = "twitter_link_config"
 
 
 @dataclass
@@ -66,6 +64,9 @@ class TwitterPlugin(Star):
         self.proxy = str(config.get("twitter_proxy", "") or "") or None
         self.use_node = bool(config.get("twitter_use_node", True))
         self.no_text = bool(config.get("twitter_no_text", False))
+        self.link_recognition_enabled = bool(
+            config.get("twitter_link_recognition_enabled", True)
+        )
         self.poll_interval = max(1, int(config.get("twitter_poll_interval", 5)))
         self.plugin_enabled = bool(config.get("plugin_enabled", True))
         self.collective_forward = bool(
@@ -144,20 +145,7 @@ class TwitterPlugin(Star):
         """保存全部订阅数据"""
         await self.put_kv_data(KV_SUBS_KEY, data)
 
-    async def _get_link_config(self) -> dict:
-        """获取链接识别配置"""
-        return await self.get_kv_data(KV_LINK_CONFIG_KEY, {})
-
-    async def _save_link_config(self, data: dict):
-        """保存链接识别配置"""
-        await self.put_kv_data(KV_LINK_CONFIG_KEY, data)
-
     # ========== 工具方法 ==========
-
-    @staticmethod
-    def _is_group(umo: str) -> bool:
-        """根据 unified_msg_origin 判断是否为群聊"""
-        return "Group" in umo
 
     async def _get_translate_provider_id(self, umo: str) -> str | None:
         """获取翻译用的 LLM Provider ID，按优先级回退
@@ -1076,26 +1064,6 @@ class TwitterPlugin(Star):
         else:
             yield event.plain_result("当前没有订阅任何推主")
 
-    @filter.command("推特链接识别", alias={"twitter_link"})
-    async def toggle_link_recognition(self, event: AstrMessageEvent, action: str = ""):
-        """开启/关闭推文链接识别，格式: /推特链接识别 开启 或 /推特链接识别 关闭"""
-        if action not in ("开启", "关闭"):
-            yield event.plain_result("用法: /推特链接识别 开启 或 /推特链接识别 关闭")
-            return
-
-        umo = event.unified_msg_origin
-        if not self._is_group(umo):
-            yield event.plain_result("此指令仅支持群聊使用")
-            return
-
-        enabled = action == "开启"
-        link_config = await self._get_link_config()
-        link_config[umo] = {"link": enabled}
-        await self._save_link_config(link_config)
-
-        status_text = "开启" if enabled else "关闭"
-        yield event.plain_result(f"推文链接识别已{status_text}")
-
     @filter.command("推特测试", alias={"twitter_test"})
     async def test_tweet(self, event: AstrMessageEvent, username: str = ""):
         """立即获取并推送指定推主的最新一条推文，格式: /推特测试 <推主id>"""
@@ -1178,6 +1146,10 @@ class TwitterPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，检测 Twitter/X 链接并解析推文"""
+        # 全局链接识别开关检查
+        if not self.link_recognition_enabled:
+            return
+
         umo = event.unified_msg_origin
         msg_str = event.message_str
 
@@ -1185,16 +1157,6 @@ class TwitterPlugin(Star):
         match = TWITTER_LINK_PATTERN.search(msg_str)
         if not match:
             return
-
-        # 群聊中检查链接识别是否开启
-        if self._is_group(umo):
-            link_config = await self._get_link_config()
-            if umo not in link_config:
-                # 默认开启
-                link_config[umo] = {"link": True}
-                await self._save_link_config(link_config)
-            if not link_config[umo].get("link", True):
-                return
 
         link = match.group(1)
         username = match.group(2)

@@ -1,8 +1,8 @@
 {
   "twitter_nitter_url": {
-    "description": "Nitter 镜像站地址（留空则使用内置列表自动选择），强烈建议本地部署Nitter！",
+    "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
     "type": "string",
-    "hint": "例如: https://nitter.net，留空自动检测可用镜像",
+    "hint": "例如: https://nitter.net",
     "default": ""
   },
   "twitter_proxy": {
@@ -26,7 +26,7 @@
     "description": "推文集体转发（将多个推主的推文合并到一条转发消息中）",
     "type": "bool",
     "default": false,
-    "hint": "开启后，轮询周期内获取的所有推文将缓存，轮询结束后统一打包发送；需同时开启合并转发消息"
+    "hint": "开启后，轮询周期内获取的所有推文将缓存，轮询结束后统一打包发送；需同时开启合并转发消息，否则不会生效"
   },
   "twitter_collective_max_authors": {
     "description": "集体转发时单条消息包含的最大推主数",
@@ -50,7 +50,7 @@
     "description": "翻译使用的 LLM Provider ID（留空则自动选择）",
     "type": "string",
     "default": "",
-    "hint": "指定翻译用的 Provider ID，留空时按以下顺序自动选择：当前会话 Provider → 主 LLM Provider → 第一个可用 Provider"
+    "hint": "指定翻译用的 Provider ID，留空时按以下顺序自动选择：当前会话 Provider → 第一个可用 Provider"
   },
   "twitter_no_text": {
     "description": "推文含媒体时不输出文字内容",
@@ -62,10 +62,5 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后，聊天中出现 twitter.com / x.com 链接时不再自动解析推文内容"
-  },
-  "plugin_enabled": {
-    "description": "插件总开关",
-    "type": "bool",
-    "default": true
   }
 }

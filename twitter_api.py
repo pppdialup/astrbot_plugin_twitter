@@ -304,34 +304,6 @@ class TwitterAPI:
 
         return result
 
-    async def get_user_timeline(self, username: str) -> list[str]:
-        """获取用户最近的推文时间线 ID 列表"""
-        if not self.nitter_url:
-            return []
-
-        client = await self._get_client()
-        url = f"{self.nitter_url}/{username}"
-        try:
-            resp = await client.get(url, timeout=15.0)
-            if resp.status_code != 200:
-                return []
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            tweet_links = soup.select("div.timeline-item a.tweet-link")
-
-            timeline = []
-            for link in tweet_links:
-                href = link.get("href", "")
-                match = re.search(r"/status/(\d+)", href)
-                if match:
-                    timeline.append(match.group(1))
-
-            return timeline
-        except Exception as e:
-            logger.error(f"获取用户时间线失败 {username}: {e}")
-            return []
-
-
 def get_next_website(website_list: list[str], current: str) -> Optional[str]:
     """获取列表中当前镜像站的下一个（循环）"""
     if not website_list:

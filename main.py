@@ -68,7 +68,6 @@ class TwitterPlugin(Star):
             config.get("twitter_link_recognition_enabled", True)
         )
         self.poll_interval = max(1, int(config.get("twitter_poll_interval", 5)))
-        self.plugin_enabled = bool(config.get("plugin_enabled", True))
         self.collective_forward = bool(
             config.get("twitter_collective_forward", False)
         )
@@ -104,6 +103,13 @@ class TwitterPlugin(Star):
         """插件初始化"""
         logger.info("Twitter 推文转发插件初始化中...")
 
+        # 集体转发模式与合并转发消息的兼容性校验
+        if self.collective_forward and not self.use_node:
+            logger.warning(
+                "集体转发模式已开启但合并转发消息未开启，集体转发功能不会生效。"
+                "请同时开启「使用合并转发消息」配置项。"
+            )
+
         # 检测可用镜像站
         available = await self.twitter_api.check_website_available(self.website_list)
         if available:
@@ -112,7 +118,7 @@ class TwitterPlugin(Star):
             logger.warning("未找到可用 Nitter 镜像站，推文轮询功能暂不可用")
 
         # 启动定时轮询任务
-        if self.plugin_enabled and self.twitter_api.nitter_url:
+        if self.twitter_api.nitter_url:
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_tweets())
             logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
@@ -146,6 +152,48 @@ class TwitterPlugin(Star):
         await self.put_kv_data(KV_SUBS_KEY, data)
 
     # ========== 工具方法 ==========
+
+    @staticmethod
+    def _build_nickname(username: str, screen_name: str) -> str:
+        """构建推主昵称显示
+
+        Args:
+            username: 推主用户名（如 elonmusk）
+            screen_name: 显示昵称（如 Elon Musk）
+
+        Returns:
+            格式化后的昵称，如 "@elonmusk (Elon Musk)" 或 "@elonmusk"
+        """
+        nickname = f"@{username}"
+        if screen_name and screen_name != username:
+            nickname += f" ({screen_name})"
+        return nickname
+
+    async def _maybe_translate(
+        self, tweet_info: dict, umo: str
+    ) -> tuple[str | None, str | None]:
+        """根据翻译配置，翻译推文文本
+
+        Args:
+            tweet_info: 推文信息字典
+            umo: 会话标识，用于获取 Provider
+
+        Returns:
+            (翻译后的文本, 翻译模型名称)；未开启翻译或翻译失败时返回 (None, None)
+        """
+        if not self.translate_enabled:
+            return None, None
+
+        original_text = str(tweet_info.get("text") or "")
+        if not original_text.strip():
+            return None, None
+
+        translated_text, translate_model = await self._translate_text(
+            original_text, umo
+        )
+        if translate_model:
+            return translated_text, translate_model
+        return None, None
 
     async def _get_translate_provider_id(self, umo: str) -> str | None:
         """获取翻译用的 LLM Provider ID，按优先级回退
@@ -272,10 +320,8 @@ class TwitterPlugin(Star):
         chain = []
 
         # 头部信息
-        header = f"@{username}"
-        if screen_name and screen_name != username:
-            header += f" ({screen_name})"
-        chain.append(Comp.Plain(str(header) + "\n"))
+        nickname = self._build_nickname(username, screen_name)
+        chain.append(Comp.Plain(str(nickname) + "\n"))
 
         # 推文正文
         has_media = bool(images) or bool(tweet_info.get("videos"))
@@ -324,6 +370,66 @@ class TwitterPlugin(Star):
         chain = [c for c in chain if c is not None]
         return chain
 
+    def _split_chain_for_nodes(
+        self, chain: list, nickname: str
+    ) -> tuple[list[Node], list[Comp.Video]]:
+        """将消息链分离为 Node 列表和待独立发送的视频列表
+
+        视频不能放在 Node 中，否则下载+上传会超出 WebSocket API 超时时间，
+        需要作为独立消息发送。
+
+        Args:
+            chain: _build_tweet_chain 生成的消息链
+            nickname: Node 显示的昵称
+
+        Returns:
+            (Node 列表, 待独立发送的视频组件列表)
+        """
+        nodes: list[Node] = []
+        video_parts: list[Comp.Video] = []
+        text_parts: list = []
+        image_parts: list[Comp.Image] = []
+
+        for comp in chain:
+            if isinstance(comp, Comp.Video):
+                video_parts.append(comp)
+            elif isinstance(comp, Comp.Image):
+                image_parts.append(comp)
+            else:
+                text_parts.append(comp)
+
+        # 文本节点
+        if text_parts:
+            nodes.append(Node(content=text_parts, name=nickname))
+        # 每张图片一个节点
+        for img_comp in image_parts:
+            nodes.append(Node(content=[img_comp], name=nickname))
+
+        return nodes, video_parts
+
+    async def _send_video_or_fallback(self, umo: str, vid_comp: Comp.Video):
+        """发送视频组件，失败时回退为链接
+
+        Args:
+            umo: 目标会话标识
+            vid_comp: 视频组件
+        """
+        try:
+            vid_chain = MessageChain(chain=[vid_comp])
+            await self.context.send_message(umo, vid_chain)
+        except Exception as vid_err:
+            logger.warning(f"视频发送失败，回退为链接: {vid_err}")
+            vid_url = getattr(vid_comp, "file", "") or getattr(
+                vid_comp, "url", ""
+            )
+            if vid_url:
+                await self.context.send_message(
+                    umo,
+                    MessageChain(
+                        chain=[Comp.Plain(str(f"视频: {vid_url}"))]
+                    ),
+                )
+
     async def _push_tweet_to_subscribers(
         self, username: str, tweet_info: dict, user_info: dict
     ):
@@ -343,28 +449,21 @@ class TwitterPlugin(Star):
             or tweet_info.get("screen_name")
             or username
         )
-        nickname = f"@{username}"
-        if screen_name and screen_name != username:
-            nickname += f" ({screen_name})"
+        nickname = self._build_nickname(username, screen_name)
 
         # 翻译推文（如果开启），同一推文只翻译一次
-        translated_text: str | None = None
-        translate_model: str | None = None
-        if self.translate_enabled:
+        first_umo = next(iter(subscribers), "")
+        translated_text, translate_model = await self._maybe_translate(
+            tweet_info, first_umo
+        )
+        if translate_model:
             original_text = str(tweet_info.get("text") or "")
-            if original_text.strip():
-                # 使用第一个订阅者的 umo 获取 Provider
-                first_umo = next(iter(subscribers), "")
-                translated_text, translate_model = await self._translate_text(
-                    original_text, first_umo
-                )
-                if translate_model:
-                    logger.info(
-                        f"推文翻译完成 @{username}: "
-                        f"模型={translate_model}, "
-                        f"原文长度={len(original_text)}, "
-                        f"译文长度={len(translated_text or '')}"
-                    )
+            logger.info(
+                f"推文翻译完成 @{username}: "
+                f"模型={translate_model}, "
+                f"原文长度={len(original_text)}, "
+                f"译文长度={len(translated_text or '')}"
+            )
 
         for umo, sub_config in subscribers.items():
             if not sub_config.get("status", True):
@@ -425,27 +524,8 @@ class TwitterPlugin(Star):
 
             if self.use_node:
                 # 合并转发模式：使用 Node/Nodes 构建合并转发消息
-                # 注意：视频不能放在 Node 中，否则下载+上传会超出
-                # WebSocket API 超时时间，需要作为独立消息发送
                 try:
-                    nodes = []
-                    video_parts = []
-                    text_parts = []
-                    image_parts = []
-                    for comp in chain:
-                        if isinstance(comp, Comp.Video):
-                            video_parts.append(comp)
-                        elif isinstance(comp, Comp.Image):
-                            image_parts.append(comp)
-                        else:
-                            text_parts.append(comp)
-
-                    # 文本节点
-                    if text_parts:
-                        nodes.append(Node(content=text_parts, name=nickname))
-                    # 每张图片一个节点
-                    for img_comp in image_parts:
-                        nodes.append(Node(content=[img_comp], name=nickname))
+                    nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
 
                     # 发送合并转发消息（文本+图片）
                     if nodes:
@@ -456,27 +536,10 @@ class TwitterPlugin(Star):
 
                     # 视频作为独立消息逐条发送
                     for vid_comp in video_parts:
-                        try:
-                            vid_chain = MessageChain(chain=[vid_comp])
-                            await self.context.send_message(umo, vid_chain)
-                        except Exception as vid_err:
-                            logger.warning(
-                                f"视频发送失败，回退为链接: {vid_err}"
-                            )
-                            vid_url = getattr(vid_comp, "file", "") or getattr(
-                                vid_comp, "url", ""
-                            )
-                            if vid_url:
-                                await self.context.send_message(
-                                    umo,
-                                    MessageChain(
-                                        chain=[
-                                            Comp.Plain(str(f"视频: {vid_url}"))
-                                        ]
-                                    ),
-                                )
+                        await self._send_video_or_fallback(umo, vid_comp)
+
                 except Exception as node_err:
-                    # 合并转发失败，回退到普通消息链
+                    # 合并转发失败，回退到普通消息链（视频改为链接）
                     logger.warning(
                         f"合并转发失败，回退到普通消息: {node_err}"
                     )
@@ -496,28 +559,25 @@ class TwitterPlugin(Star):
                         message_chain = MessageChain(chain=fallback_chain)
                         await self.context.send_message(umo, message_chain)
             else:
-                # 纯文本模式
-                images = tweet_info.get("images") or []
-                text = str(translated_text or tweet_info.get("text") or "")
-                tweet_id = str(tweet_info.get("tweet_id") or "")
-                screen_name = str(tweet_info.get("screen_name") or username)
-                parts = [f"@{username} ({screen_name})"]
-                has_media = bool(images) or bool(tweet_info.get("videos"))
-                if not (self.no_text and has_media):
-                    if text:
-                        parts.append(text)
-                quote = tweet_info.get("quote")
-                if quote:
-                    parts.append(
-                        f"引用 @{str(quote.get('author', ''))}: {str(quote.get('text', ''))}"
-                    )
-                if tweet_id:
-                    parts.append(f"https://x.com/{username}/status/{tweet_id}")
-                if translate_model and translated_text is not None:
-                    parts.append(f"（由 {translate_model} 翻译自原文）")
-                plain_text = "\n".join(parts)
-                message_chain = MessageChain(chain=[Comp.Plain(str(plain_text))])
-                await self.context.send_message(umo, message_chain)
+                # 纯文本模式：将消息链中非文本组件转为文本描述
+                plain_chain = []
+                for comp in chain:
+                    if isinstance(comp, Comp.Image):
+                        # 图片无法在纯文本模式下展示，跳过
+                        pass
+                    elif isinstance(comp, Comp.Video):
+                        vid_url = getattr(comp, "file", "") or getattr(
+                            comp, "url", ""
+                        )
+                        if vid_url:
+                            plain_chain.append(
+                                Comp.Plain(str(f"\n视频: {vid_url}"))
+                            )
+                    else:
+                        plain_chain.append(comp)
+                if plain_chain:
+                    message_chain = MessageChain(chain=plain_chain)
+                    await self.context.send_message(umo, message_chain)
 
             logger.info(f"推文已推送至 {umo}")
         except Exception as e:
@@ -577,7 +637,7 @@ class TwitterPlugin(Star):
 
                 for batch_idx, batch_authors in enumerate(author_batches):
                     nodes: list[Node] = []
-                    video_queue: list[tuple[str, Comp.Video]] = []
+                    video_queue: list[Comp.Video] = []
 
                     for author in batch_authors:
                         for ct in seen_authors[author]:
@@ -589,31 +649,11 @@ class TwitterPlugin(Star):
                             if not chain:
                                 continue
 
-                            # 分离视频和其他组件
-                            text_parts = []
-                            image_parts = []
-                            vid_parts = []
-                            for comp in chain:
-                                if isinstance(comp, Comp.Video):
-                                    vid_parts.append(comp)
-                                elif isinstance(comp, Comp.Image):
-                                    image_parts.append(comp)
-                                else:
-                                    text_parts.append(comp)
-
-                            # 文本节点
-                            if text_parts:
-                                nodes.append(
-                                    Node(content=text_parts, name=ct.nickname)
-                                )
-                            # 每张图片一个节点
-                            for img_comp in image_parts:
-                                nodes.append(
-                                    Node(content=[img_comp], name=ct.nickname)
-                                )
-                            # 视频记录，稍后独立发送
-                            for vid_comp in vid_parts:
-                                video_queue.append((ct.nickname, vid_comp))
+                            ct_nodes, ct_videos = self._split_chain_for_nodes(
+                                chain, ct.nickname
+                            )
+                            nodes.extend(ct_nodes)
+                            video_queue.extend(ct_videos)
 
                     # 发送合并转发消息
                     if nodes:
@@ -652,26 +692,8 @@ class TwitterPlugin(Star):
                             video_queue.clear()
 
                     # 逐条发送视频（独立消息，避免超时）
-                    for vid_nickname, vid_comp in video_queue:
-                        try:
-                            vid_chain = MessageChain(chain=[vid_comp])
-                            await self.context.send_message(umo, vid_chain)
-                        except Exception as vid_err:
-                            logger.warning(
-                                f"集体转发视频发送失败，回退为链接: {vid_err}"
-                            )
-                            vid_url = getattr(vid_comp, "file", "") or getattr(
-                                vid_comp, "url", ""
-                            )
-                            if vid_url:
-                                await self.context.send_message(
-                                    umo,
-                                    MessageChain(
-                                        chain=[
-                                            Comp.Plain(str(f"视频: {vid_url}"))
-                                        ]
-                                    ),
-                                )
+                    for vid_comp in video_queue:
+                        await self._send_video_or_fallback(umo, vid_comp)
 
             except Exception as e:
                 logger.error(f"集体转发推送至 {umo} 失败: {e}")
@@ -1093,14 +1115,9 @@ class TwitterPlugin(Star):
         tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
 
         # 翻译推文
-        translated_text = None
-        translate_model = None
-        if self.translate_enabled:
-            original_text = str(tweet_info.get("text") or "")
-            if original_text.strip():
-                translated_text, translate_model = await self._translate_text(
-                    original_text, umo
-                )
+        translated_text, translate_model = await self._maybe_translate(
+            tweet_info, umo
+        )
 
         # 构建并返回消息
         chain = self._build_tweet_chain(
@@ -1115,26 +1132,16 @@ class TwitterPlugin(Star):
         if self.use_node:
             # 合并转发模式
             screen_name = str(tweet_info.get("screen_name") or username)
-            nickname = f"@{username}"
-            if screen_name and screen_name != username:
-                nickname += f" ({screen_name})"
+            nickname = self._build_nickname(username, screen_name)
             try:
-                nodes = []
-                text_parts = []
-                image_parts = []
-                for comp in chain:
-                    if isinstance(comp, Comp.Image):
-                        image_parts.append(comp)
-                    else:
-                        text_parts.append(comp)
-                if text_parts:
-                    nodes.append(Node(content=text_parts, name=nickname))
-                for img_comp in image_parts:
-                    nodes.append(Node(content=[img_comp], name=nickname))
+                nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
                 if nodes:
                     yield event.chain_result([Nodes(nodes)])
                 else:
                     yield event.plain_result(f"未找到 @{username} 的推文内容")
+                # 视频无法通过 yield 发送，作为独立消息发送
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
             except Exception:
                 # 合并转发失败，回退到普通消息链
                 yield event.chain_result(chain)
@@ -1171,14 +1178,9 @@ class TwitterPlugin(Star):
             tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
 
             # 翻译推文
-            translated_text = None
-            translate_model = None
-            if self.translate_enabled:
-                original_text = str(tweet_info.get("text") or "")
-                if original_text.strip():
-                    translated_text, translate_model = await self._translate_text(
-                        original_text, umo
-                    )
+            translated_text, translate_model = await self._maybe_translate(
+                tweet_info, umo
+            )
 
             # 构建推文消息链
             chain = self._build_tweet_chain(
@@ -1193,25 +1195,17 @@ class TwitterPlugin(Star):
 
             if self.use_node:
                 # 合并转发模式
-                sn = str(tweet_info.get("screen_name") or username)
-                nk = f"@{username}"
-                if sn and sn != username:
-                    nk += f" ({sn})"
+                screen_name = str(tweet_info.get("screen_name") or username)
+                nickname = self._build_nickname(username, screen_name)
                 try:
-                    nodes = []
-                    text_parts = []
-                    image_parts = []
-                    for comp in chain:
-                        if isinstance(comp, Comp.Image):
-                            image_parts.append(comp)
-                        else:
-                            text_parts.append(comp)
-                    if text_parts:
-                        nodes.append(Node(content=text_parts, name=nk))
-                    for img_comp in image_parts:
-                        nodes.append(Node(content=[img_comp], name=nk))
+                    nodes, video_parts = self._split_chain_for_nodes(
+                        chain, nickname
+                    )
                     if nodes:
                         yield event.chain_result([Nodes(nodes)])
+                    # 视频无法通过 yield 发送，作为独立消息发送
+                    for vid_comp in video_parts:
+                        await self._send_video_or_fallback(umo, vid_comp)
                 except Exception:
                     yield event.chain_result(chain)
             else:

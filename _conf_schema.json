@@ -38,7 +38,7 @@
     "description": "推文内容翻译开关",
     "type": "bool",
     "default": false,
-    "hint": "开启后，推文正文将被翻译为目标语言，原文被替换；需至少配置一个可用的 LLM Provider"
+    "hint": "开启后，推文正文将被翻译为目标语言"
   },
   "twitter_translate_target_lang": {
     "description": "翻译目标语言",
@@ -56,6 +56,13 @@
     "description": "推文含媒体时不输出文字内容",
     "type": "bool",
     "default": false
+  },
+  "twitter_image_quality": {
+    "description": "推文图片质量",
+    "type": "string",
+    "default": "orig",
+    "options": ["large", "orig"],
+    "hint": "large=缩略图，orig=原图（默认）"
   },
   "twitter_link_recognition_enabled": {
     "description": "推文链接识别全局开关",

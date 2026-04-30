@@ -82,6 +82,9 @@ class TwitterPlugin(Star):
             config.get("twitter_translate_provider_id", "") or ""
         ).strip()
         custom_nitter_url = str(config.get("twitter_nitter_url", "") or "").strip()
+        self.image_quality = str(
+            config.get("twitter_image_quality", "orig") or "orig"
+        ).strip()
 
         # 构建镜像站列表
         self.website_list: list[str] = []
@@ -90,7 +93,9 @@ class TwitterPlugin(Star):
         self.website_list.extend(WEBSITE_LIST)
 
         # 初始化 Twitter API
-        self.twitter_api = TwitterAPI(proxy=self.proxy, nitter_url="")
+        self.twitter_api = TwitterAPI(
+            proxy=self.proxy, nitter_url="", image_quality=self.image_quality
+        )
 
         # 定时任务句柄
         self._poll_task: asyncio.Task | None = None

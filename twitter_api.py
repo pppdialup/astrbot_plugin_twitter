@@ -15,13 +15,21 @@ WEBSITE_LIST = [
     "https://nitter.net",
 ]
 
+# 有效的图片质量选项
+IMAGE_QUALITY_OPTIONS = ("large", "orig")
+
+# 直播推文链接特征（推文链接中包含此路径即为直播）
+BROADCAST_LINK_PATTERN = re.compile(r'/i/broadcasts/', re.IGNORECASE)
+
 
 class TwitterAPI:
     """Twitter API 交互类，通过 Nitter 镜像站获取推文"""
 
-    def __init__(self, proxy: Optional[str] = None, nitter_url: str = ""):
+    def __init__(self, proxy: Optional[str] = None, nitter_url: str = "",
+                 image_quality: str = "orig"):
         self.proxy = proxy
         self.nitter_url = nitter_url
+        self.image_quality = image_quality if image_quality in IMAGE_QUALITY_OPTIONS else "orig"
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -165,6 +173,16 @@ class TwitterAPI:
             logger.error(f"获取用户时间线失败 {username}: {e}")
             return []
 
+    def _build_image_url(self, a_href: str, img_src: str) -> str:
+        """根据图片质量配置构建图片 URL
+        orig 原图：使用 <a> href（Nitter /pic/orig/ 路由，追加 name=orig&format=jpg）
+        large 缩略图：直接使用 <img> src 原样返回（Nitter 默认缩略图，webp 格式）
+        """
+        if self.image_quality == "orig":
+            return a_href
+        return img_src
+
+
     async def get_tweet(self, username: str, tweet_id: str) -> dict:
         """获取推文详细信息
 
@@ -200,12 +218,8 @@ class TwitterAPI:
             # Nitter 推文详情页：主贴在 div.main-tweet 内，评论在其后
             main_tweet = soup.select_one("div.main-tweet")
             if not main_tweet:
-                # 某些实例可能没有 main-tweet 包裹，回退到整个页面
-                logger.warning(
-                    f"未找到 div.main-tweet 容器，"
-                    f"回退到整个页面选择（可能匹配评论区内容）"
-                )
-                main_tweet = soup
+                logger.warning(f"未找到 div.main-tweet 容器: {nitter_url}")
+                return result
 
             # 获取显示名称
             fullname_elem = main_tweet.select_one("a.fullname")
@@ -216,27 +230,14 @@ class TwitterAPI:
             content_elem = main_tweet.select_one("div.tweet-content.media-body")
             if content_elem:
                 result["text"] = content_elem.get_text(strip=True)
-            else:
-                # 调试：尝试更宽松的选择器，排查 HTML 结构差异
-                fallback_elem = main_tweet.select_one("div.tweet-content")
-                if fallback_elem:
-                    result["text"] = fallback_elem.get_text(strip=True)
-                    logger.info(
-                        f"推文正文通过 div.tweet-content 提取（无 media-body 类）"
-                    )
-                else:
-                    logger.warning(
-                        f"未找到推文正文，"
-                        f"main-tweet 内 HTML 片段: "
-                        f"{str(main_tweet)[:500]}"
-                    )
 
             # 获取图片（仅主贴，排除视频/GIF缩略图）
-            # Nitter 中真实图片附件使用 <a class="still-image"> 包裹 <img>，
-            # 而视频缩略图 <img loading="lazy"> 不在 still-image 内，以此区分
-            img_elems = main_tweet.select("a.still-image img")
-            for img in img_elems:
-                src = img.get("src", "")
+            attachments = main_tweet.select("a.still-image")
+            for a_tag in attachments:
+                a_href = a_tag.get("href", "")
+                img = a_tag.select_one("img")
+                img_src = img.get("src", "") if img else ""
+                src = self._build_image_url(a_href, img_src)
                 if src:
                     if not src.startswith("http"):
                         src = f"{self.nitter_url}{src}"
@@ -249,6 +250,7 @@ class TwitterAPI:
             #   3) 播放被禁用: 仅有 <img> 缩略图 + <div class="video-overlay">
             video_elems = main_tweet.select("div.attachment video")
             seen_urls: set[str] = set()
+            is_live_stream = False
             for video in video_elems:
                 # 方式1: <source src="">（mp4格式）
                 for source in video.find_all("source"):
@@ -276,14 +278,31 @@ class TwitterAPI:
                         seen_urls.add(data_url)
                         result["videos"].append(data_url)
 
-            # 检测视频附件但未提取到视频URL的情况
-            video_overlays = main_tweet.select("div.video-overlay")
-            if video_overlays and not result["videos"]:
-                logger.warning(
-                    f"检测到视频附件但未提取到视频URL，"
-                    f"可能 Nitter 实例({self.nitter_url})禁用了视频播放。"
-                    f"请在 Nitter 实例偏好设置中启用 mp4 playback"
+            # 检测直播推文并过滤
+            is_live_stream = False
+            for link in main_tweet.select("a"):
+                href = link.get("href", "")
+                if href and BROADCAST_LINK_PATTERN.search(href):
+                    is_live_stream = True
+                    break
+
+            if is_live_stream:
+                logger.info(
+                    f"检测到直播/流媒体视频 @{username}/{tweet_id}，"
+                    f"过滤所有媒体内容"
                 )
+                result["videos"] = []
+                result["images"] = []
+
+            # 检测视频附件但未提取到视频URL的情况
+            if not is_live_stream:
+                video_overlays = main_tweet.select("div.video-overlay")
+                if video_overlays and not result["videos"]:
+                    logger.warning(
+                        f"检测到视频附件但未提取到视频URL，"
+                        f"可能 Nitter 实例({self.nitter_url})禁用了视频播放。"
+                        f"请在 Nitter 配置中设置 hlsPlayback = true 且 proxyVideo = false"
+                    )
 
             # 获取引用推文（仅主贴）
             quote_elem = main_tweet.select_one("div.quote")
@@ -311,5 +330,5 @@ def get_next_website(website_list: list[str], current: str) -> Optional[str]:
     try:
         idx = website_list.index(current)
         return website_list[(idx + 1) % len(website_list)]
-    except (ValueError, IndexError):
+    except ValueError:
         return website_list[0]

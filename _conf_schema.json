@@ -1,73 +1,113 @@
 {
-  "twitter_nitter_url": {
-    "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
-    "type": "string",
-    "hint": "例如: https://nitter.net",
-    "default": ""
+  "basic": {
+    "description": "基础设置",
+    "type": "object",
+    "hint": "Nitter 镜像站、代理与轮询等基础配置。",
+    "items": {
+      "twitter_nitter_url": {
+        "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
+        "type": "string",
+        "hint": "例如: https://nitter.net",
+        "default": ""
+      },
+      "twitter_proxy": {
+        "description": "代理地址（留空则不使用代理）",
+        "type": "string",
+        "hint": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+        "default": ""
+      },
+      "twitter_poll_interval": {
+        "description": "推文轮询间隔（分钟）",
+        "type": "int",
+        "default": 5,
+        "hint": "建议不低于 3 分钟，避免频繁请求"
+      }
+    }
   },
-  "twitter_proxy": {
-    "description": "代理地址（留空则不使用代理）",
-    "type": "string",
-    "hint": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
-    "default": ""
+  "message_format": {
+    "description": "消息格式",
+    "type": "object",
+    "hint": "控制推文推送的消息样式、合并转发行为、媒体质量及帖子链接。",
+    "items": {
+      "twitter_use_node": {
+        "description": "使用合并转发消息发送推文",
+        "type": "bool",
+        "default": true
+      },
+      "twitter_no_text": {
+        "description": "推文含媒体时不输出文字内容",
+        "type": "bool",
+        "default": false
+      },
+      "twitter_image_quality": {
+        "description": "推文图片质量",
+        "type": "string",
+        "default": "orig",
+        "options": ["large", "orig"],
+        "hint": "large=缩略图，orig=原图（默认）"
+      },
+      "twitter_collective_forward": {
+        "description": "推文集体转发（将多个推主的推文合并到一条转发消息中）",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，轮询周期内获取的所有推文将缓存，轮询结束后统一打包发送；需同时开启合并转发消息，否则不会生效"
+      },
+      "twitter_collective_max_authors": {
+        "description": "集体转发时单条消息包含的最大推主数",
+        "type": "int",
+        "default": 5,
+        "hint": "超过此数量的推主将分组为多条合并转发消息；仅集体转发模式下生效"
+      },
+      "twitter_include_tweet_link": {
+        "description": "推送消息附带帖子链接",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后消息末尾附带对应 X/Twitter 帖子链接；关闭后轮询推送、推特测试和链接识别解析出的推文消息都不附带帖子链接"
+      }
+    }
   },
-  "twitter_poll_interval": {
-    "description": "推文轮询间隔（分钟）",
-    "type": "int",
-    "default": 5,
-    "hint": "建议不低于 3 分钟，避免频繁请求"
+  "content_filter": {
+    "description": "内容过滤",
+    "type": "object",
+    "hint": "控制转帖推送、链接识别等内容策略。",
+    "items": {
+      "twitter_include_retweets": {
+        "description": "轮询推送和推特测试时推送转帖",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会推送转帖，并在消息中标明谁转发了谁；关闭后轮询跳过转帖，/推特测试会寻找最新的非转贴推文"
+      },
+      "twitter_link_recognition_enabled": {
+        "description": "推文链接识别全局开关",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，聊天中出现 twitter.com / x.com 链接时不再自动解析推文内容"
+      }
+    }
   },
-  "twitter_use_node": {
-    "description": "使用合并转发消息发送推文",
-    "type": "bool",
-    "default": true
-  },
-  "twitter_collective_forward": {
-    "description": "推文集体转发（将多个推主的推文合并到一条转发消息中）",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，轮询周期内获取的所有推文将缓存，轮询结束后统一打包发送；需同时开启合并转发消息，否则不会生效"
-  },
-  "twitter_collective_max_authors": {
-    "description": "集体转发时单条消息包含的最大推主数",
-    "type": "int",
-    "default": 5,
-    "hint": "超过此数量的推主将分组为多条合并转发消息；仅集体转发模式下生效"
-  },
-  "twitter_translate_enabled": {
-    "description": "推文内容翻译开关",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后，推文正文将被翻译为目标语言"
-  },
-  "twitter_translate_target_lang": {
-    "description": "翻译目标语言",
-    "type": "string",
-    "default": "简体中文",
-    "hint": "推文内容将被翻译为此语言，如：简体中文、日语、英语"
-  },
-  "twitter_translate_provider_id": {
-    "description": "翻译使用的 LLM Provider ID（留空则自动选择）",
-    "type": "string",
-    "default": "",
-    "hint": "指定翻译用的 Provider ID，留空时按以下顺序自动选择：当前会话 Provider → 第一个可用 Provider"
-  },
-  "twitter_no_text": {
-    "description": "推文含媒体时不输出文字内容",
-    "type": "bool",
-    "default": false
-  },
-  "twitter_image_quality": {
-    "description": "推文图片质量",
-    "type": "string",
-    "default": "orig",
-    "options": ["large", "orig"],
-    "hint": "large=缩略图，orig=原图（默认）"
-  },
-  "twitter_link_recognition_enabled": {
-    "description": "推文链接识别全局开关",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后，聊天中出现 twitter.com / x.com 链接时不再自动解析推文内容"
+  "translation": {
+    "description": "翻译设置",
+    "type": "object",
+    "hint": "配置推文内容的自动翻译行为，需至少一个可用的 LLM Provider。",
+    "items": {
+      "twitter_translate_enabled": {
+        "description": "推文内容翻译开关",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，推文正文将被翻译为目标语言"
+      },
+      "twitter_translate_target_lang": {
+        "description": "翻译目标语言",
+        "type": "string",
+        "default": "简体中文",
+        "hint": "推文内容将被翻译为此语言，如：简体中文、日语、英语"
+      },
+      "twitter_translate_provider_id": {
+        "description": "翻译使用的 LLM Provider ID（留空则自动选择）",
+        "type": "string",
+        "default": "",
+        "hint": "指定翻译用的 Provider ID，留空时按以下顺序自动选择：当前会话 Provider → 第一个可用 Provider"
+      }
+    }
   }
 }

@@ -13,9 +13,23 @@ AstrBot Twitter 推文转发插件
   /推特测试 <推主id>                        - 立即获取并推送指定推主最新一条推文
 
 配置项:
-  推文内容翻译开关 (twitter_translate_enabled)   - 开启后推文正文自动翻译
-  翻译目标语言 (twitter_translate_target_lang)    - 如：简体中文、日语、英语
-  翻译 LLM Provider ID (twitter_translate_provider_id) - 留空则自动选择
+  【基础设置】
+    Nitter 镜像站地址 (twitter_nitter_url)        - 留空则自动选择
+    代理地址 (twitter_proxy)                      - 如 http://127.0.0.1:7890
+    轮询间隔 (twitter_poll_interval)              - 默认 5 分钟
+  【消息格式】
+    合并转发消息 (twitter_use_node)               - 默认开启
+    含媒体时隐藏文字 (twitter_no_text)            - 默认关闭
+    图片质量 (twitter_image_quality)              - orig / large
+    集体转发 (twitter_collective_forward)         - 默认关闭
+    附带帖子链接 (twitter_include_tweet_link)     - 默认开启
+  【内容过滤】
+    推送转帖 (twitter_include_retweets)           - 默认开启
+    链接识别 (twitter_link_recognition_enabled)   - 默认开启
+  【翻译设置】
+    翻译开关 (twitter_translate_enabled)          - 默认关闭
+    目标语言 (twitter_translate_target_lang)      - 默认简体中文
+    LLM Provider (twitter_translate_provider_id)  - 留空自动选择
 
 当消息中包含 twitter.com 或 x.com 的推文链接时，自动解析并发送推文内容。
 """
@@ -56,40 +70,88 @@ class CachedTweet:
 class TwitterPlugin(Star):
     """Twitter 推文转发插件主类"""
 
+    def _cfg(self, block: str, key: str, default, *legacy_keys: str):
+        """读取分组配置，并兼容旧版顶层扁平配置。"""
+        block_config = self.config.get(block, {}) or {}
+        if isinstance(block_config, dict):
+            val = block_config.get(key)
+            if val is not None:
+                return val
+
+        for cfg_key in (key, *legacy_keys):
+            val = self.config.get(cfg_key)
+            if val is not None:
+                return val
+
+        return default
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
 
         # 读取配置
-        self.proxy = str(config.get("twitter_proxy", "") or "") or None
-        self.use_node = bool(config.get("twitter_use_node", True))
-        self.no_text = bool(config.get("twitter_no_text", False))
+        self.proxy = str(self._cfg("basic", "twitter_proxy", "") or "") or None
+        self.use_node = bool(self._cfg("message_format", "twitter_use_node", True))
+        self.no_text = bool(self._cfg("message_format", "twitter_no_text", False))
         self.link_recognition_enabled = bool(
-            config.get("twitter_link_recognition_enabled", True)
+            self._cfg(
+                "content_filter",
+                "twitter_link_recognition_enabled",
+                True,
+            )
         )
-        self.poll_interval = max(1, int(config.get("twitter_poll_interval", 5)))
+        self.poll_interval = max(
+            1, int(self._cfg("basic", "twitter_poll_interval", 5))
+        )
         self.collective_forward = bool(
-            config.get("twitter_collective_forward", False)
+            self._cfg("message_format", "twitter_collective_forward", False)
+        )
+        self.include_retweets = bool(
+            self._cfg("content_filter", "twitter_include_retweets", True)
+        )
+        self.include_tweet_link = bool(
+            self._cfg(
+                "message_format",
+                "twitter_include_tweet_link",
+                True,
+                "twitter_retweet_include_link",
+            )
         )
         self.collective_max_authors = max(
-            1, int(config.get("twitter_collective_max_authors", 5))
+            1,
+            int(
+                self._cfg(
+                    "message_format",
+                    "twitter_collective_max_authors",
+                    5,
+                )
+            ),
         )
-        self.translate_enabled = bool(config.get("twitter_translate_enabled", False))
+        self.translate_enabled = bool(
+            self._cfg("translation", "twitter_translate_enabled", False)
+        )
         self.translate_target_lang = str(
-            config.get("twitter_translate_target_lang", "简体中文") or "简体中文"
+            self._cfg(
+                "translation",
+                "twitter_translate_target_lang",
+                "简体中文",
+            )
+            or "简体中文"
         )
         self.translate_provider_id = str(
-            config.get("twitter_translate_provider_id", "") or ""
+            self._cfg("translation", "twitter_translate_provider_id", "") or ""
         ).strip()
-        custom_nitter_url = str(config.get("twitter_nitter_url", "") or "").strip()
+        self.custom_nitter_url = str(
+            self._cfg("basic", "twitter_nitter_url", "") or ""
+        ).strip()
         self.image_quality = str(
-            config.get("twitter_image_quality", "orig") or "orig"
+            self._cfg("message_format", "twitter_image_quality", "orig") or "orig"
         ).strip()
 
         # 构建镜像站列表
         self.website_list: list[str] = []
-        if custom_nitter_url:
-            self.website_list.append(custom_nitter_url)
+        if self.custom_nitter_url:
+            self.website_list.append(self.custom_nitter_url)
         self.website_list.extend(WEBSITE_LIST)
 
         # 初始化 Twitter API
@@ -174,31 +236,97 @@ class TwitterPlugin(Star):
             nickname += f" ({screen_name})"
         return nickname
 
+    @staticmethod
+    def _build_author_display(username: str, screen_name: str) -> str:
+        """构建推文作者显示，兼容只有昵称或用户名的情况。"""
+        username = str(username or "").lstrip("@")
+        screen_name = str(screen_name or "")
+        if username:
+            return TwitterPlugin._build_nickname(username, screen_name or username)
+        return screen_name or "未知用户"
+
+    @staticmethod
+    def _attach_timeline_item_metadata(tweet_info: dict, item: dict):
+        """把时间线条目上的转帖元数据补到推文详情里。"""
+        tweet_info["username"] = str(
+            item.get("username") or tweet_info.get("username") or ""
+        )
+        if item.get("is_retweet"):
+            tweet_info["retweet"] = {
+                "retweeter_username": str(item.get("retweeter_username") or ""),
+                "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
+            }
+
+    @staticmethod
+    def _tweet_has_media(tweet_info: dict) -> bool:
+        """判断主贴或引用帖是否包含媒体。"""
+        if tweet_info.get("images") or tweet_info.get("videos"):
+            return True
+        quote = tweet_info.get("quote") or {}
+        return bool(quote.get("images") or quote.get("videos"))
+
+    def _append_media_components(
+        self, chain: list, images: list, videos: list, context_label: str = "推文"
+    ):
+        """把图片和视频追加到消息链，供主贴和引用帖复用。"""
+        for img_url in images:
+            try:
+                img_comp = Comp.Image.fromURL(str(img_url))
+                if img_comp is not None:
+                    chain.append(img_comp)
+            except Exception as e:
+                logger.warning(f"添加{context_label}图片失败: {img_url}, {e}")
+
+        for v_url in videos:
+            try:
+                video_comp = Comp.Video.fromURL(str(v_url))
+                if video_comp is not None:
+                    chain.append(video_comp)
+            except Exception as e:
+                logger.warning(
+                    f"添加{context_label}视频失败，回退为链接: {v_url}, {e}"
+                )
+                chain.append(Comp.Plain(str(f"\n视频: {v_url}")))
+
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
     ) -> tuple[str | None, str | None]:
-        """根据翻译配置，翻译推文文本
+        """根据翻译配置，翻译推文文本和引用推文文本
 
         Args:
             tweet_info: 推文信息字典
             umo: 会话标识，用于获取 Provider
 
         Returns:
-            (翻译后的文本, 翻译模型名称)；未开启翻译或翻译失败时返回 (None, None)
+            (主贴翻译后的文本, 翻译模型名称)；引用推文译文写入 quote.translated_text。
         """
         if not self.translate_enabled:
             return None, None
 
         original_text = str(tweet_info.get("text") or "")
-        if not original_text.strip():
-            return None, None
+        quote = tweet_info.get("quote") or {}
+        quote_text = str(quote.get("text") or "")
 
-        translated_text, translate_model = await self._translate_text(
-            original_text, umo
-        )
-        if translate_model:
-            return translated_text, translate_model
-        return None, None
+        translated_text: str | None = None
+        translate_model: str | None = None
+
+        if original_text.strip():
+            main_translated, main_model = await self._translate_text(
+                original_text, umo
+            )
+            if main_model:
+                translated_text = main_translated
+                translate_model = main_model
+
+        if quote_text.strip():
+            quote_translated, quote_model = await self._translate_text(
+                quote_text, umo
+            )
+            if quote_model:
+                quote["translated_text"] = quote_translated
+                translate_model = translate_model or quote_model
+
+        return translated_text, translate_model
 
     async def _get_translate_provider_id(self, umo: str) -> str | None:
         """获取翻译用的 LLM Provider ID，按优先级回退
@@ -320,53 +448,65 @@ class TwitterPlugin(Star):
         images = tweet_info.get("images") or []
         quote = tweet_info.get("quote")
         tweet_id = str(tweet_info.get("tweet_id") or "")
-        screen_name = str(tweet_info.get("screen_name") or username)
+        author_username = str(tweet_info.get("username") or username)
+        screen_name = str(tweet_info.get("screen_name") or author_username)
+        retweet = tweet_info.get("retweet") or None
 
         chain = []
 
         # 头部信息
-        nickname = self._build_nickname(username, screen_name)
-        chain.append(Comp.Plain(str(nickname) + "\n"))
+        nickname = self._build_author_display(author_username, screen_name)
+        if retweet:
+            retweeter_username = str(retweet.get("retweeter_username") or username)
+            retweeter_screen_name = str(
+                retweet.get("retweeter_screen_name") or retweeter_username
+            )
+            retweeter = self._build_author_display(
+                retweeter_username, retweeter_screen_name
+            )
+            chain.append(Comp.Plain(str(f"{retweeter} 转发了 {nickname} 的帖子\n")))
+        else:
+            chain.append(Comp.Plain(str(nickname) + "\n"))
 
         # 推文正文
-        has_media = bool(images) or bool(tweet_info.get("videos"))
+        has_media = self._tweet_has_media(tweet_info)
         if not (self.no_text and has_media):
             if text:
                 chain.append(Comp.Plain(str(text) + "\n"))
 
         # 引用推文
         if quote:
-            quote_author = str(quote.get("author") or "")
-            quote_text = str(quote.get("text") or "")
-            chain.append(Comp.Plain(str(f"\n引用 @{quote_author}:\n{quote_text}\n")))
+            quote_author_username = str(quote.get("username") or "")
+            quote_author = str(quote.get("author") or quote_author_username)
+            quote_text = str(quote.get("translated_text") or quote.get("text") or "")
+            quote_display = self._build_author_display(
+                quote_author_username, quote_author
+            )
+            chain.append(
+                Comp.Plain(str(f"\n{nickname} 引用了 {quote_display} 的帖子\n"))
+            )
+            if quote_text:
+                chain.append(Comp.Plain(str(quote_text) + "\n"))
+            self._append_media_components(
+                chain,
+                quote.get("images") or [],
+                quote.get("videos") or [],
+                context_label="引用推文",
+            )
 
-        # 图片
-        for img_url in images:
-            try:
-                img_comp = Comp.Image.fromURL(str(img_url))
-                if img_comp is not None:
-                    chain.append(img_comp)
-            except Exception as e:
-                logger.warning(f"添加图片失败: {img_url}, {e}")
-
-        # 视频
-        videos = tweet_info.get("videos") or []
-        for v_url in videos:
-            try:
-                video_comp = Comp.Video.fromURL(str(v_url))
-                if video_comp is not None:
-                    chain.append(video_comp)
-            except Exception as e:
-                logger.warning(f"添加视频失败，回退为链接: {v_url}, {e}")
-                chain.append(Comp.Plain(str(f"\n视频: {v_url}")))
+        # 主贴媒体
+        self._append_media_components(
+            chain, images, tweet_info.get("videos") or [], context_label="推文"
+        )
 
         # 推文链接
-        if tweet_id:
-            link = f"\nhttps://x.com/{username}/status/{tweet_id}"
+        if tweet_id and self.include_tweet_link:
+            link = f"\nhttps://x.com/{author_username}/status/{tweet_id}"
             chain.append(Comp.Plain(str(link)))
 
         # 翻译说明标注
-        if translate_model and translated_text is not None:
+        quote_translated = bool((quote or {}).get("translated_text"))
+        if translate_model and (translated_text is not None or quote_translated):
             chain.append(
                 Comp.Plain(str(f"\n（由 {translate_model} 翻译自原文）"))
             )
@@ -454,7 +594,14 @@ class TwitterPlugin(Star):
             or tweet_info.get("screen_name")
             or username
         )
-        nickname = self._build_nickname(username, screen_name)
+        retweet = tweet_info.get("retweet") or {}
+        if retweet:
+            nickname = self._build_author_display(
+                str(retweet.get("retweeter_username") or username),
+                str(retweet.get("retweeter_screen_name") or screen_name),
+            )
+        else:
+            nickname = self._build_nickname(username, screen_name)
 
         # 翻译推文（如果开启），同一推文只翻译一次
         first_umo = next(iter(subscribers), "")
@@ -463,10 +610,11 @@ class TwitterPlugin(Star):
         )
         if translate_model:
             original_text = str(tweet_info.get("text") or "")
+            quote_text = str((tweet_info.get("quote") or {}).get("text") or "")
             logger.info(
                 f"推文翻译完成 @{username}: "
                 f"模型={translate_model}, "
-                f"原文长度={len(original_text)}, "
+                f"原文长度={len(original_text) + len(quote_text)}, "
                 f"译文长度={len(translated_text or '')}"
             )
 
@@ -480,8 +628,7 @@ class TwitterPlugin(Star):
                 continue
 
             # 媒体过滤
-            images = tweet_info.get("images") or []
-            if sub_config.get("media", False) and not images:
+            if sub_config.get("media", False) and not self._tweet_has_media(tweet_info):
                 continue
 
             # 集体转发模式：缓存推文，轮询结束后统一发送
@@ -749,7 +896,7 @@ class TwitterPlugin(Star):
             await self._flush_collected_tweets()
 
         # 自动切换镜像站
-        if not self.config.get("twitter_nitter_url", "") and results:
+        if not self.custom_nitter_url and results:
             success_count = sum(1 for r in results if r)
             if success_count < len(results) / 2 and self.website_list:
                 new_url = get_next_website(
@@ -763,11 +910,11 @@ class TwitterPlugin(Star):
         """检查某个用户的新推文，返回是否成功获取"""
         try:
             since_id = info.get("since_id", "")
-            new_tweet_ids = await self.twitter_api.get_user_newtimeline(
+            new_tweet_items = await self.twitter_api.get_user_timeline_items(
                 username, since_id
             )
 
-            if not new_tweet_ids:
+            if not new_tweet_items:
                 return True
 
             # 再次确认该推主仍有订阅者（可能在获取推文期间被取关）
@@ -778,14 +925,30 @@ class TwitterPlugin(Star):
 
             # 按时间正序（最旧在前）逐条处理
             # （集体转发模式下缓存，即时模式下直接推送）
-            for tweet_id in new_tweet_ids:
-                tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
+            for item in new_tweet_items:
+                if item.get("is_retweet") and not self.include_retweets:
+                    logger.debug(
+                        f"跳过 @{username} 转帖: {item.get('tweet_id')}"
+                    )
+                    continue
+
+                tweet_id = str(item.get("tweet_id") or "")
+                tweet_username = str(item.get("username") or username)
+                if not tweet_id:
+                    continue
+
+                tweet_info = await self.twitter_api.get_tweet(
+                    tweet_username, tweet_id
+                )
+                self._attach_timeline_item_metadata(tweet_info, item)
                 await self._push_tweet_to_subscribers(username, tweet_info, info)
 
             # 更新 since_id 为最新一条
             subs = await self._get_subs()
             if username in subs:
-                subs[username]["since_id"] = new_tweet_ids[-1]
+                subs[username]["since_id"] = str(
+                    new_tweet_items[-1].get("tweet_id") or since_id
+                )
                 await self._save_subs(subs)
 
             return True
@@ -1108,16 +1271,29 @@ class TwitterPlugin(Star):
 
         yield event.plain_result(f"正在获取 @{username} 的最新推文，请稍候...")
 
-        # 获取最新推文 ID
-        latest_ids = await self.twitter_api.get_user_newtimeline(username)
-        if not latest_ids:
+        # 获取时间线并按配置选择最新推文
+        timeline_items = await self.twitter_api.get_user_timeline_items(username)
+        if not timeline_items:
             yield event.plain_result(f"未找到 @{username} 的推文")
             return
 
-        tweet_id = latest_ids[-1]
+        selected_item = None
+        for item in timeline_items:
+            if item.get("is_retweet") and not self.include_retweets:
+                continue
+            selected_item = item
+            break
+
+        if not selected_item:
+            yield event.plain_result(f"未找到 @{username} 的非转贴推文")
+            return
+
+        tweet_id = str(selected_item.get("tweet_id") or "")
+        tweet_username = str(selected_item.get("username") or username)
 
         # 获取推文详情
-        tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
+        tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
+        self._attach_timeline_item_metadata(tweet_info, selected_item)
 
         # 翻译推文
         translated_text, translate_model = await self._maybe_translate(
@@ -1136,8 +1312,9 @@ class TwitterPlugin(Star):
 
         if self.use_node:
             # 合并转发模式
-            screen_name = str(tweet_info.get("screen_name") or username)
-            nickname = self._build_nickname(username, screen_name)
+            author_username = str(tweet_info.get("username") or username)
+            screen_name = str(tweet_info.get("screen_name") or author_username)
+            nickname = self._build_author_display(author_username, screen_name)
             try:
                 nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
                 if nodes:
@@ -1200,8 +1377,9 @@ class TwitterPlugin(Star):
 
             if self.use_node:
                 # 合并转发模式
-                screen_name = str(tweet_info.get("screen_name") or username)
-                nickname = self._build_nickname(username, screen_name)
+                author_username = str(tweet_info.get("username") or username)
+                screen_name = str(tweet_info.get("screen_name") or author_username)
+                nickname = self._build_author_display(author_username, screen_name)
                 try:
                     nodes, video_parts = self._split_chain_for_nodes(
                         chain, nickname

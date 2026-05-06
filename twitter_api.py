@@ -7,7 +7,7 @@ import re
 from typing import Optional
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from astrbot.api import logger
 
 # 内置 Nitter 镜像站列表
@@ -123,6 +123,85 @@ class TwitterAPI:
         Returns:
             新推文 ID 列表（时间正序），无新推文时返回空列表
         """
+        items = await self.get_user_timeline_items(
+            username,
+            since_id=since_id,
+            limit=1 if not since_id else 0,
+        )
+        return [str(item.get("tweet_id") or "") for item in items if item.get("tweet_id")]
+
+    def _parse_timeline_items(
+        self,
+        soup: BeautifulSoup,
+        username: str,
+        since_id: str = "",
+        limit: int = 0,
+    ) -> list[dict]:
+        """解析用户时间线条目。
+
+        有 since_id 时返回时间正序（最旧在前）；无 since_id 时保持 Nitter 页面顺序
+        （最新在前），便于测试指令向后寻找下一条非转帖。
+        """
+        timeline_items = soup.select("div.timeline-item")
+        parsed_items: list[dict] = []
+
+        for item in timeline_items:
+            # 检测置顶推文标记并跳过
+            if item.select_one(".pinned, .icon-pin"):
+                continue
+
+            link = item.select_one("a.tweet-link")
+            if not link:
+                continue
+
+            href = link.get("href", "")
+            match = re.search(r"/([^/]+)/status/(\d+)", href)
+            if not match:
+                continue
+
+            tweet_username = match.group(1)
+            tweet_id = match.group(2)
+            retweet_header = item.select_one(".retweet-header")
+
+            if since_id:
+                try:
+                    if int(tweet_id) <= int(since_id):
+                        if retweet_header:
+                            continue
+                        # 时间线按最新优先，遇到 <= since_id 的即可停止
+                        break
+                except ValueError:
+                    continue
+
+            retweeter_screen_name = ""
+            if retweet_header:
+                retweeter_screen_name = (
+                    retweet_header.get_text(" ", strip=True)
+                    .replace("retweeted", "")
+                    .strip()
+                )
+
+            parsed_items.append(
+                {
+                    "tweet_id": tweet_id,
+                    "username": tweet_username or item.get("data-username") or username,
+                    "is_retweet": retweet_header is not None,
+                    "retweeter_username": username,
+                    "retweeter_screen_name": retweeter_screen_name,
+                }
+            )
+
+            if limit > 0 and len(parsed_items) >= limit:
+                break
+
+        if since_id:
+            parsed_items.reverse()
+        return parsed_items
+
+    async def get_user_timeline_items(
+        self, username: str, since_id: str = "", limit: int = 0
+    ) -> list[dict]:
+        """获取用户时间线条目，包含转帖元数据。"""
         if not self.nitter_url:
             return []
 
@@ -134,41 +213,12 @@ class TwitterAPI:
                 return []
 
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            # 获取所有 timeline-item，跳过置顶推文
-            timeline_items = soup.select("div.timeline-item")
-            new_ids: list[str] = []
-
-            for item in timeline_items:
-                # 检测置顶推文标记并跳过
-                if item.select_one(".pinned, .icon-pin"):
-                    continue
-
-                link = item.select_one("a.tweet-link")
-                if not link:
-                    continue
-
-                href = link.get("href", "")
-                match = re.search(r"/status/(\d+)", href)
-                if match:
-                    tweet_id = match.group(1)
-                    if not since_id:
-                        # 无 since_id 时仅取最新一条（用于首次订阅定位）
-                        return [tweet_id]
-
-                    try:
-                        if int(tweet_id) > int(since_id):
-                            new_ids.append(tweet_id)
-                        else:
-                            # 时间线按最新优先，遇到 <= since_id 的即可停止
-                            break
-                    except ValueError:
-                        # ID 解析异常，跳过
-                        continue
-
-            # 反转为时间正序（最旧在前）
-            new_ids.reverse()
-            return new_ids
+            return self._parse_timeline_items(
+                soup,
+                username=username,
+                since_id=since_id,
+                limit=limit,
+            )
         except Exception as e:
             logger.error(f"获取用户时间线失败 {username}: {e}")
             return []
@@ -182,12 +232,97 @@ class TwitterAPI:
             return a_href
         return img_src
 
+    def _absolute_url(self, url: str) -> str:
+        """将 Nitter 相对路径转换为绝对 URL。"""
+        if not url or url.startswith("http"):
+            return url
+        return f"{self.nitter_url}{url}"
+
+    @staticmethod
+    def _is_nested_quote_element(tag: Tag, root: Tag) -> bool:
+        """判断元素是否位于 root 内部的引用帖容器中。"""
+        for parent in tag.parents:
+            if parent is root:
+                return False
+            classes = parent.get("class") or []
+            if "quote" in classes:
+                return True
+        return False
+
+    def _extract_images(
+        self, container: Tag, include_nested_quotes: bool = False
+    ) -> list[str]:
+        """从指定容器提取图片 URL。"""
+        images: list[str] = []
+        attachments = container.select("a.still-image")
+        for a_tag in attachments:
+            if not include_nested_quotes and self._is_nested_quote_element(
+                a_tag, container
+            ):
+                continue
+            a_href = a_tag.get("href", "")
+            img = a_tag.select_one("img")
+            img_src = img.get("src", "") if img else ""
+            src = self._build_image_url(a_href, img_src)
+            if src:
+                images.append(self._absolute_url(src))
+        return images
+
+    def _extract_videos(
+        self, container: Tag, include_nested_quotes: bool = False
+    ) -> list[str]:
+        """从指定容器提取视频/GIF URL。"""
+        videos: list[str] = []
+        video_elems = container.select("div.attachment video")
+        seen_urls: set[str] = set()
+        for video in video_elems:
+            if not include_nested_quotes and self._is_nested_quote_element(
+                video, container
+            ):
+                continue
+            for source in video.find_all("source"):
+                src = source.get("src", "")
+                if src:
+                    src = self._absolute_url(src)
+                    if src not in seen_urls:
+                        seen_urls.add(src)
+                        videos.append(src)
+
+            src = video.get("src", "")
+            if src:
+                src = self._absolute_url(src)
+                if src not in seen_urls:
+                    seen_urls.add(src)
+                    videos.append(src)
+
+            data_url = video.get("data-url", "")
+            if data_url:
+                data_url = self._absolute_url(data_url)
+                if data_url not in seen_urls:
+                    seen_urls.add(data_url)
+                    videos.append(data_url)
+        return videos
+
+    def _contains_live_stream(
+        self, container: Tag, include_nested_quotes: bool = False
+    ) -> bool:
+        """检测容器内是否包含直播链接。"""
+        for link in container.select("a"):
+            if not include_nested_quotes and self._is_nested_quote_element(
+                link, container
+            ):
+                continue
+            href = link.get("href", "")
+            if href and BROADCAST_LINK_PATTERN.search(href):
+                return True
+        return False
 
     async def get_tweet(self, username: str, tweet_id: str) -> dict:
         """获取推文详细信息
 
         Returns:
-            推文信息字典，包含 text, images, videos, quote, is_r18, screen_name 等
+            推文信息字典，包含 text, images, videos, quote, is_r18,
+            screen_name, retweet 等
         """
         result = {
             "tweet_id": tweet_id,
@@ -197,6 +332,7 @@ class TwitterAPI:
             "images": [],
             "videos": [],
             "quote": None,
+            "retweet": None,
             "is_r18": False,
         }
 
@@ -232,59 +368,17 @@ class TwitterAPI:
                 result["text"] = content_elem.get_text(strip=True)
 
             # 获取图片（仅主贴，排除视频/GIF缩略图）
-            attachments = main_tweet.select("a.still-image")
-            for a_tag in attachments:
-                a_href = a_tag.get("href", "")
-                img = a_tag.select_one("img")
-                img_src = img.get("src", "") if img else ""
-                src = self._build_image_url(a_href, img_src)
-                if src:
-                    if not src.startswith("http"):
-                        src = f"{self.nitter_url}{src}"
-                    result["images"].append(src)
+            result["images"] = self._extract_images(main_tweet)
 
             # 获取视频/GIF（仅主贴）
             # Nitter 视频有三种HTML形态：
             #   1) mp4播放启用: <video><source src=""></video>
             #   2) m3u8/vmap格式: <video data-url=""> (无src/source)
             #   3) 播放被禁用: 仅有 <img> 缩略图 + <div class="video-overlay">
-            video_elems = main_tweet.select("div.attachment video")
-            seen_urls: set[str] = set()
-            is_live_stream = False
-            for video in video_elems:
-                # 方式1: <source src="">（mp4格式）
-                for source in video.find_all("source"):
-                    src = source.get("src", "")
-                    if src:
-                        if not src.startswith("http"):
-                            src = f"{self.nitter_url}{src}"
-                        if src not in seen_urls:
-                            seen_urls.add(src)
-                            result["videos"].append(src)
-                # 方式2: <video src="">（GIF或直接src）
-                src = video.get("src", "")
-                if src:
-                    if not src.startswith("http"):
-                        src = f"{self.nitter_url}{src}"
-                    if src not in seen_urls:
-                        seen_urls.add(src)
-                        result["videos"].append(src)
-                # 方式3: <video data-url="">（m3u8/vmap格式）
-                data_url = video.get("data-url", "")
-                if data_url:
-                    if not data_url.startswith("http"):
-                        data_url = f"{self.nitter_url}{data_url}"
-                    if data_url not in seen_urls:
-                        seen_urls.add(data_url)
-                        result["videos"].append(data_url)
+            result["videos"] = self._extract_videos(main_tweet)
 
             # 检测直播推文并过滤
-            is_live_stream = False
-            for link in main_tweet.select("a"):
-                href = link.get("href", "")
-                if href and BROADCAST_LINK_PATTERN.search(href):
-                    is_live_stream = True
-                    break
+            is_live_stream = self._contains_live_stream(main_tweet)
 
             if is_live_stream:
                 logger.info(
@@ -307,11 +401,43 @@ class TwitterAPI:
             # 获取引用推文（仅主贴）
             quote_elem = main_tweet.select_one("div.quote")
             if quote_elem:
-                quote_text_elem = quote_elem.select_one("div.tweet-content")
+                quote_text_elem = quote_elem.select_one(
+                    "div.quote-text, div.tweet-content"
+                )
                 quote_author = quote_elem.select_one("a.fullname")
+                quote_username = quote_elem.select_one("a.username")
+                quote_link = quote_elem.select_one("a.quote-link")
+                quote_href = quote_link.get("href", "") if quote_link else ""
+                quote_id_match = re.search(r"/status/(\d+)", quote_href)
+                quote_live_stream = self._contains_live_stream(
+                    quote_elem,
+                    include_nested_quotes=True,
+                )
                 result["quote"] = {
                     "author": quote_author.get_text(strip=True) if quote_author else "",
+                    "username": (
+                        quote_username.get_text(strip=True).lstrip("@")
+                        if quote_username
+                        else ""
+                    ),
+                    "tweet_id": quote_id_match.group(1) if quote_id_match else "",
                     "text": quote_text_elem.get_text(strip=True) if quote_text_elem else "",
+                    "images": (
+                        []
+                        if quote_live_stream
+                        else self._extract_images(
+                            quote_elem,
+                            include_nested_quotes=True,
+                        )
+                    ),
+                    "videos": (
+                        []
+                        if quote_live_stream
+                        else self._extract_videos(
+                            quote_elem,
+                            include_nested_quotes=True,
+                        )
+                    ),
                 }
 
             # 检测 R18 标记（仅主贴）

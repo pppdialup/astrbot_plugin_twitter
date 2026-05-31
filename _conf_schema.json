@@ -1,15 +1,22 @@
 {
+  "twitterapi": {
+    "description": "twitterapi.io 设置",
+    "type": "object",
+    "hint": "基于 twitterapi.io REST API 访问 Twitter/X 数据，无需 OAuth。",
+    "items": {
+      "twitter_api_key": {
+        "description": "twitterapi.io API Key",
+        "type": "string",
+        "hint": "在 https://twitterapi.io/dashboard 获取，格式如: twiapikey_xxxxx",
+        "default": ""
+      }
+    }
+  },
   "basic": {
     "description": "基础设置",
     "type": "object",
-    "hint": "Nitter 镜像站、代理与轮询等基础配置。",
+    "hint": "代理与轮询等基础配置。",
     "items": {
-      "twitter_nitter_url": {
-        "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
-        "type": "string",
-        "hint": "例如: https://nitter.net",
-        "default": ""
-      },
       "twitter_proxy": {
         "description": "代理地址（留空则不使用代理）",
         "type": "string",
@@ -20,7 +27,57 @@
         "description": "推文轮询间隔（分钟）",
         "type": "int",
         "default": 5,
-        "hint": "建议不低于 3 分钟，避免频繁请求"
+        "hint": "建议不低于 3 分钟，避免频繁请求消耗 API 额度"
+      }
+    }
+  },
+  "schedule": {
+    "description": "定时任务调度",
+    "type": "object",
+    "hint": "配置定时任务的休眠时间段，在休眠时间内不会执行推文轮询，避免浪费 API 调用次数。",
+    "items": {
+      "twitter_sleep_start": {
+        "description": "休眠开始时间（小时，0-23）",
+        "type": "int",
+        "default": 0,
+        "hint": "如设为 0 表示凌晨 0:00 开始休眠"
+      },
+      "twitter_sleep_end": {
+        "description": "休眠结束时间（小时，0-23）",
+        "type": "int",
+        "default": 8,
+        "hint": "如设为 8 表示早上 8:00 结束休眠。若与开始时间相同则不启用休眠"
+      }
+    }
+  },
+  "redis": {
+    "description": "Redis 缓存设置",
+    "type": "object",
+    "hint": "Redis 用于缓存推文数据，减少 API 调用次数。若不配置则使用内存缓存。",
+    "items": {
+      "twitter_redis_host": {
+        "description": "Redis 主机地址",
+        "type": "string",
+        "default": "127.0.0.1",
+        "hint": "Redis 服务器地址"
+      },
+      "twitter_redis_port": {
+        "description": "Redis 端口",
+        "type": "int",
+        "default": 6379,
+        "hint": "Redis 服务器端口，默认 6379"
+      },
+      "twitter_redis_password": {
+        "description": "Redis 密码（留空则无密码）",
+        "type": "string",
+        "default": "",
+        "hint": "若 Redis 设置了密码验证则填写"
+      },
+      "twitter_redis_db": {
+        "description": "Redis 数据库编号",
+        "type": "int",
+        "default": 0,
+        "hint": "使用的 Redis 数据库编号，默认 0"
       }
     }
   },
@@ -70,7 +127,7 @@
         "description": "轮询时汇总多条新推文为一条合并转发消息",
         "type": "bool",
         "default": false,
-        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启“单条推文使用合并转发消息发送”，否则不会生效"
+        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启「单条推文使用合并转发消息发送」，否则不会生效"
       },
       "twitter_collective_max_authors": {
         "description": "集体转发时单条消息包含的最大推主数",

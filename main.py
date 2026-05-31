@@ -1,6 +1,6 @@
 """
 AstrBot Twitter 推文转发插件
-基于 Nitter 镜像站，支持订阅推主、定时推送、链接识别、合并转发消息、推文翻译
+基于 twitterapi.io REST API，支持订阅推主、定时推送、链接识别、合并转发消息、推文翻译
 
 指令列表:
   /推特关注 <推主id> [r18] [媒体]          - 订阅推主
@@ -8,15 +8,22 @@ AstrBot Twitter 推文转发插件
   /推特取关 <推主id>                        - 取关推主
   /推特批量取关 <推主id1> <推主id2> ...     - 批量取关推主
   /推特清空订阅                             - 清空所有订阅（仅管理员）
+  /推特清空缓存                             - 清空推文缓存（仅管理员）
   /推特列表                                 - 查看当前订阅列表
   /推特推送 开启/关闭                       - 开启/关闭推送
   /推特测试 <推主id>                        - 立即获取并推送指定推主最新一条推文
 
 配置项:
+  【twitterapi.io 设置】
+    API Key (twitter_api_key)                     - twitterapi.io 平台 API Key
   【基础设置】
-    Nitter 镜像站地址 (twitter_nitter_url)        - 留空则自动选择
     代理地址 (twitter_proxy)                      - 如 http://127.0.0.1:7890
     轮询间隔 (twitter_poll_interval)              - 默认 5 分钟
+  【定时任务调度】
+    休眠开始时间 (twitter_sleep_start)            - 默认 0 (0:00)
+    休眠结束时间 (twitter_sleep_end)              - 默认 8 (8:00)
+  【Redis 缓存设置】
+    Redis 主机/端口/密码/数据库编号
   【消息格式】
     合并转发消息 (twitter_use_node)               - 默认开启
     含媒体时隐藏文字 (twitter_no_text)            - 默认关闭
@@ -35,6 +42,8 @@ AstrBot Twitter 推文转发插件
 """
 
 import asyncio
+import datetime
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -44,7 +53,7 @@ from astrbot.api.message_components import Node, Nodes
 from astrbot.api.star import Context, Star
 import astrbot.api.message_components as Comp
 
-from .twitter_api import TwitterAPI, WEBSITE_LIST, get_next_website
+from .twitter_api import TwitterAPI
 from .twitter_renderer import (
     build_tweet_card_context,
     load_tweet_card_template,
@@ -58,6 +67,9 @@ TWITTER_LINK_PATTERN = re.compile(
 
 # KV 存储键名
 KV_SUBS_KEY = "twitter_subs"
+
+# Redis 缓存键前缀
+REDIS_KEY_PREFIX = "twitter:tweet:"
 
 
 @dataclass
@@ -94,7 +106,14 @@ class TwitterPlugin(Star):
         super().__init__(context)
         self.config = config
 
-        # 读取配置
+        # 读取 twitterapi.io 配置
+        self.api_key = str(
+            self._cfg("twitterapi", "twitter_api_key", "")
+            or self._cfg("basic", "twitter_nitter_url", "")  # 兼容旧版配置项名
+            or ""
+        ).strip()
+
+        # 读取基础配置
         self.proxy = str(self._cfg("basic", "twitter_proxy", "") or "") or None
         self.use_node = bool(self._cfg("message_format", "twitter_use_node", True))
         self.no_text = bool(self._cfg("message_format", "twitter_no_text", False))
@@ -182,23 +201,35 @@ class TwitterPlugin(Star):
         self.translate_provider_id = str(
             self._cfg("translation", "twitter_translate_provider_id", "") or ""
         ).strip()
-        self.custom_nitter_url = str(
-            self._cfg("basic", "twitter_nitter_url", "") or ""
-        ).strip()
         self.image_quality = str(
             self._cfg("message_format", "twitter_image_quality", "orig") or "orig"
         ).strip()
 
-        # 构建镜像站列表
-        self.website_list: list[str] = []
-        if self.custom_nitter_url:
-            self.website_list.append(self.custom_nitter_url)
-        self.website_list.extend(WEBSITE_LIST)
+        # 读取休眠时间配置
+        self.sleep_start = int(self._cfg("schedule", "twitter_sleep_start", 0))
+        self.sleep_end = int(self._cfg("schedule", "twitter_sleep_end", 8))
+        # 如果开始和结束相同，则不启用休眠
+        self._sleep_enabled = self.sleep_start != self.sleep_end
+
+        # 读取 Redis 配置
+        self.redis_host = str(
+            self._cfg("redis", "twitter_redis_host", "127.0.0.1")
+        ).strip()
+        self.redis_port = int(self._cfg("redis", "twitter_redis_port", 6379))
+        self.redis_password = str(
+            self._cfg("redis", "twitter_redis_password", "")
+        ).strip()
+        self.redis_db = int(self._cfg("redis", "twitter_redis_db", 0))
 
         # 初始化 Twitter API
         self.twitter_api = TwitterAPI(
-            proxy=self.proxy, nitter_url="", image_quality=self.image_quality
+            api_key=self.api_key,
+            proxy=self.proxy,
+            image_quality=self.image_quality,
         )
+
+        # Redis 客户端
+        self._redis: "redis.Redis | None" = None
 
         # 定时任务句柄
         self._poll_task: asyncio.Task | None = None
@@ -206,6 +237,98 @@ class TwitterPlugin(Star):
 
         # 集体转发推文缓存：{umo: [CachedTweet, ...]}
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
+
+    # ========== Redis 缓存管理 ==========
+
+    def _init_redis(self):
+        """初始化 Redis 连接"""
+        try:
+            import redis as redis_lib
+
+            redis_kwargs = {
+                "host": self.redis_host,
+                "port": self.redis_port,
+                "db": self.redis_db,
+                "socket_connect_timeout": 5,
+                "socket_timeout": 5,
+                "decode_responses": True,
+                "protocol": 2,  # RESP2: 兼容旧版 Redis (3.x)，避免 HELLO 命令报错
+            }
+            if self.redis_password:
+                redis_kwargs["password"] = self.redis_password
+
+            self._redis = redis_lib.Redis(**redis_kwargs)
+            # 测试连接
+            self._redis.ping()
+            logger.info(
+                f"Redis 连接成功: {self.redis_host}:{self.redis_port} "
+                f"db={self.redis_db}"
+            )
+        except ImportError:
+            logger.warning(
+                "redis 包未安装，推文缓存功能将使用内存缓存。"
+                "建议执行: pip install redis"
+            )
+            self._redis = None
+        except Exception as e:
+            logger.warning(f"Redis 连接失败 ({self.redis_host}:{self.redis_port}): {e}")
+            self._redis = None
+
+    # 内存缓存回退（当 Redis 不可用时）
+    _memory_cache: dict[str, str] = {}
+
+    def _cache_key(self, username: str) -> str:
+        """生成缓存键"""
+        return f"{REDIS_KEY_PREFIX}{username}:latest"
+
+    async def _cache_get_tweet(self, username: str) -> dict | None:
+        """从缓存获取推文数据"""
+        cache_key = self._cache_key(username)
+        try:
+            if self._redis:
+                data = self._redis.get(cache_key)
+                if data:
+                    return json.loads(data)
+            else:
+                data = self._memory_cache.get(cache_key)
+                if data:
+                    return json.loads(data)
+        except Exception as e:
+            logger.warning(f"读取缓存失败 ({username}): {e}")
+        return None
+
+    async def _cache_set_tweet(self, username: str, tweet_data: dict):
+        """将推文数据写入缓存"""
+        cache_key = self._cache_key(username)
+        try:
+            json_str = json.dumps(tweet_data, ensure_ascii=False, default=str)
+            if self._redis:
+                # Redis 缓存：设置 1 小时过期
+                self._redis.setex(cache_key, 3600, json_str)
+            else:
+                self._memory_cache[cache_key] = json_str
+            logger.debug(f"推文缓存已更新: {username}")
+        except Exception as e:
+            logger.warning(f"写入缓存失败 ({username}): {e}")
+
+    # ========== 休眠时间检查 ==========
+
+    def _is_in_sleep_period(self) -> bool:
+        """检查当前是否处于休眠时间段"""
+        if not self._sleep_enabled:
+            return False
+
+        now = datetime.datetime.now()
+        current_hour = now.hour
+
+        if self.sleep_start < self.sleep_end:
+            # 正常区间，如 0:00 - 8:00
+            return self.sleep_start <= current_hour < self.sleep_end
+        else:
+            # 跨日区间，如 22:00 - 6:00
+            return current_hour >= self.sleep_start or current_hour < self.sleep_end
+
+    # ========== 生命周期 ==========
 
     async def initialize(self):
         """插件初始化"""
@@ -218,18 +341,44 @@ class TwitterPlugin(Star):
                 "请同时开启「使用合并转发消息」配置项。"
             )
 
-        # 检测可用镜像站
-        available = await self.twitter_api.check_website_available(self.website_list)
-        if available:
-            logger.info(f"当前使用 Nitter 镜像站: {available}")
+        # 初始化 Redis
+        self._init_redis()
+
+        # 清理过期的媒体缓存文件（7 天以上 + 总大小超过 500MB）
+        try:
+            media_removed = self.twitter_api.cleanup_old_media_cache()
+            if media_removed > 0:
+                logger.info(f"启动时清理过期媒体缓存: {media_removed} 个文件")
+        except Exception as e:
+            logger.debug(f"媒体缓存清理跳过: {e}")
+
+        # 验证 API key
+        if not self.api_key:
+            logger.warning(
+                "未配置 twitterapi.io API Key，推文功能暂不可用。"
+                "请在配置中设置 twitterapi.io 的 API Key"
+            )
         else:
-            logger.warning("未找到可用 Nitter 镜像站，推文轮询功能暂不可用")
+            is_valid = await self.twitter_api.validate_api_key()
+            if is_valid:
+                logger.info("twitterapi.io API Key 验证成功")
+            else:
+                logger.warning(
+                    "twitterapi.io API Key 验证失败，请检查 Key 是否正确。"
+                    "推文功能可能不可用"
+                )
 
         # 启动定时轮询任务
-        if self.twitter_api.nitter_url:
+        if self.api_key:
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_tweets())
-            logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
+            if self._sleep_enabled:
+                logger.info(
+                    f"推文轮询已启动，间隔 {self.poll_interval} 分钟，"
+                    f"休眠时段: {self.sleep_start}:00 - {self.sleep_end}:00"
+                )
+            else:
+                logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
 
         logger.info("Twitter 推文转发插件初始化完成")
 
@@ -247,6 +396,12 @@ class TwitterPlugin(Star):
             logger.info("正在发送剩余缓存的推文...")
             await self._flush_collected_tweets()
         await self.twitter_api.close()
+        # 关闭 Redis 连接
+        if self._redis:
+            try:
+                self._redis.close()
+            except Exception:
+                pass
         logger.info("Twitter 推文转发插件已停止")
 
     # ========== 数据管理（KV 存储） ==========
@@ -312,7 +467,9 @@ class TwitterPlugin(Star):
         url = str(video_url or "").lower()
         return ".m3u8" in url or "vmap" in url
 
-    def _video_limit_message(self, video_url: str, size_bytes: int | None = None) -> str:
+    def _video_limit_message(
+        self, video_url: str, size_bytes: int | None = None
+    ) -> str:
         """构建超限视频降级为链接时展示给用户的文本。"""
         size_note = ""
         if size_bytes:
@@ -323,7 +480,9 @@ class TwitterPlugin(Star):
             f"已改为发送链接：{video_url}"
         )
 
-    async def _video_exceeds_size_limit(self, video_url: str) -> tuple[bool, int | None]:
+    async def _video_exceeds_size_limit(
+        self, video_url: str
+    ) -> tuple[bool, int | None]:
         """尽量检查视频大小；未知大小和流媒体 URL 默认放行。"""
         if self._is_stream_video_url(video_url):
             return False, None
@@ -338,24 +497,46 @@ class TwitterPlugin(Star):
     async def _append_media_components(
         self, chain: list, images: list, videos: list, context_label: str = "推文"
     ):
-        """把图片和视频追加到消息链，供主贴和引用帖复用。"""
+        """把图片和视频追加到消息链，供主贴和引用帖复用。
+
+        图片通过代理预下载到临时文件再发送，避免 AstrBot 直连
+        Twitter CDN (pbs.twimg.com) 超时。
+        """
         for img_url in images:
             try:
-                img_comp = Comp.Image.fromURL(str(img_url))
-                if img_comp is not None:
-                    chain.append(img_comp)
+                local_path = await self.twitter_api.download_media(str(img_url))
+                if local_path:
+                    img_comp = Comp.Image.fromFileSystem(local_path)
+                    if img_comp is not None:
+                        chain.append(img_comp)
+                    else:
+                        # 本地文件加载失败，使用文本链接
+                        logger.warning(f"{context_label}图片文件加载失败: {img_url}")
+                        chain.append(Comp.Plain(f"\n图片: {img_url}"))
+                else:
+                    # 下载失败，使用文本链接（不用 Comp.Image.fromURL，
+                    # 因为 AstrBot 直连 pbs.twimg.com 在中国大陆必定超时）
+                    logger.warning(f"{context_label}图片下载失败: {img_url}")
+                    chain.append(Comp.Plain(f"\n图片: {img_url}"))
             except Exception as e:
                 logger.warning(f"添加{context_label}图片失败: {img_url}, {e}")
+                chain.append(Comp.Plain(f"\n图片: {img_url}"))
 
         for v_url in videos:
             video_url = str(v_url)
             try:
-                exceeds_limit, size_bytes = await self._video_exceeds_size_limit(video_url)
+                exceeds_limit, size_bytes = await self._video_exceeds_size_limit(
+                    video_url
+                )
                 if exceeds_limit:
                     logger.warning(
                         f"{context_label}视频超过大小限制，已改为链接: {video_url}"
                     )
-                    chain.append(Comp.Plain(str(self._video_limit_message(video_url, size_bytes))))
+                    chain.append(
+                        Comp.Plain(
+                            str(self._video_limit_message(video_url, size_bytes))
+                        )
+                    )
                     continue
 
                 video_comp = Comp.Video.fromURL(video_url)
@@ -370,10 +551,13 @@ class TwitterPlugin(Star):
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
     ) -> tuple[str | None, str | None]:
-        """根据翻译配置，翻译推文文本和引用推文文本
+        """根据翻译配置，翻译推文文本和引用推文文本。
+
+        优先使用 tweet_info 中已缓存的翻译（_translated_text / _translate_model），
+        避免重复调用 LLM。翻译完成后将结果回写到 tweet_info 中以便缓存持久化。
 
         参数:
-            tweet_info: 推文信息字典
+            tweet_info: 推文信息字典（翻译结果会回写到此字典）
             umo: 会话标识，用于获取 Provider
 
         返回:
@@ -389,21 +573,39 @@ class TwitterPlugin(Star):
         translated_text: str | None = None
         translate_model: str | None = None
 
+        # ---- 主贴翻译 ----
         if original_text.strip():
-            main_translated, main_model = await self._translate_text(
-                original_text, umo
-            )
-            if main_model:
-                translated_text = main_translated
-                translate_model = main_model
+            # 检查是否有已缓存的翻译
+            cached_translation = tweet_info.get("_translated_text")
+            cached_model = tweet_info.get("_translate_model")
+            if cached_translation is not None:
+                logger.debug(f"命中翻译缓存，跳过 LLM 调用")
+                translated_text = cached_translation
+                translate_model = cached_model
+            else:
+                main_translated, main_model = await self._translate_text(
+                    original_text, umo
+                )
+                if main_model:
+                    translated_text = main_translated
+                    translate_model = main_model
+                    # 回写到 tweet_info 以便后续缓存
+                    tweet_info["_translated_text"] = translated_text
+                    tweet_info["_translate_model"] = translate_model
 
+        # ---- 引用推文翻译 ----
         if quote_text.strip():
-            quote_translated, quote_model = await self._translate_text(
-                quote_text, umo
-            )
-            if quote_model:
-                quote["translated_text"] = quote_translated
-                translate_model = translate_model or quote_model
+            # 检查引用推文是否已有缓存翻译
+            if quote.get("translated_text"):
+                logger.debug("命中引用翻译缓存，跳过 LLM 调用")
+                translate_model = translate_model or tweet_info.get("_translate_model")
+            else:
+                quote_translated, quote_model = await self._translate_text(
+                    quote_text, umo
+                )
+                if quote_model:
+                    quote["translated_text"] = quote_translated
+                    translate_model = translate_model or quote_model
 
         return translated_text, translate_model
 
@@ -419,7 +621,9 @@ class TwitterPlugin(Star):
         if self.translate_provider_id:
             provider = self.context.get_provider_by_id(self.translate_provider_id)
             if provider:
-                logger.debug(f"翻译使用配置指定的 Provider: {self.translate_provider_id}")
+                logger.debug(
+                    f"翻译使用配置指定的 Provider: {self.translate_provider_id}"
+                )
                 return self.translate_provider_id
             logger.warning(
                 f"配置的翻译 Provider '{self.translate_provider_id}' 不可用，尝试回退"
@@ -474,7 +678,7 @@ class TwitterPlugin(Star):
             f"保持原文的语气和格式（如换行、表情符号等）。"
         )
 
-        max_retries = 2
+        max_retries = 1
         for attempt in range(max_retries):
             try:
                 llm_resp = await self.context.llm_generate(
@@ -601,13 +805,17 @@ class TwitterPlugin(Star):
         chain = [c for c in chain if c is not None]
         return chain
 
-    def _tweet_link_component(self, tweet_info: dict, fallback_username: str) -> Comp.Plain | None:
+    def _tweet_link_component(
+        self, tweet_info: dict, fallback_username: str
+    ) -> Comp.Plain | None:
         """构建可选的推文链接组件。"""
         tweet_id = str(tweet_info.get("tweet_id") or "")
         author_username = str(tweet_info.get("username") or fallback_username)
         if not (tweet_id and self.include_tweet_link):
             return None
-        return Comp.Plain(str(f"https://x.com/{author_username}/status/{tweet_id}"))
+        return Comp.Plain(
+            str(f"https://x.com/{author_username}/status/{tweet_id}")
+        )
 
     @staticmethod
     def _append_to_last_plain(chain: list, text: str) -> None:
@@ -866,7 +1074,9 @@ class TwitterPlugin(Star):
                 continue
 
             # 媒体过滤
-            if sub_config.get("media", False) and not self._tweet_has_media(tweet_info):
+            if sub_config.get("media", False) and not self._tweet_has_media(
+                tweet_info
+            ):
                 continue
 
             # 集体转发模式：缓存推文，轮询结束后统一发送
@@ -887,7 +1097,11 @@ class TwitterPlugin(Star):
 
             # 即时推送模式
             await self._send_tweet_to_subscriber(
-                umo, username, tweet_info, sub_config, nickname,
+                umo,
+                username,
+                tweet_info,
+                sub_config,
+                nickname,
                 translated_text=translated_text,
                 translate_model=translate_model,
             )
@@ -905,7 +1119,9 @@ class TwitterPlugin(Star):
         """向单个订阅者发送推文消息"""
         try:
             chain = await self._build_tweet_message_chain(
-                username, tweet_info, sub_config,
+                username,
+                tweet_info,
+                sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
             )
@@ -919,9 +1135,7 @@ class TwitterPlugin(Star):
 
                     # 发送合并转发消息（文本+图片）
                     if nodes:
-                        message_chain = MessageChain(
-                            chain=[Nodes(nodes)]
-                        )
+                        message_chain = MessageChain(chain=[Nodes(nodes)])
                         await self.context.send_message(umo, message_chain)
 
                     # 视频作为独立消息逐条发送
@@ -930,9 +1144,7 @@ class TwitterPlugin(Star):
 
                 except Exception as node_err:
                     # 合并转发失败，回退到普通消息链（视频改为链接）
-                    logger.warning(
-                        f"合并转发失败，回退到普通消息: {node_err}"
-                    )
+                    logger.warning(f"合并转发失败，回退到普通消息: {node_err}")
                     fallback_chain = self._build_plain_chain(chain)
                     if fallback_chain:
                         message_chain = MessageChain(chain=fallback_chain)
@@ -1009,7 +1221,9 @@ class TwitterPlugin(Star):
                     for author in batch_authors:
                         for ct in seen_authors[author]:
                             chain = await self._build_tweet_message_chain(
-                                ct.username, ct.tweet_info, ct.sub_config,
+                                ct.username,
+                                ct.tweet_info,
+                                ct.sub_config,
                                 translated_text=ct.translated_text,
                                 translate_model=ct.translate_model,
                             )
@@ -1081,20 +1295,42 @@ class TwitterPlugin(Star):
                             f"集体转发回退逐条发送也失败: {fallback_err}"
                         )
 
+    # ========== 定时轮询 ==========
+
     async def _poll_tweets(self):
         """定时轮询推文"""
+        logger.debug("推文轮询任务已启动（后台协程）")
         while self._running:
+            loop_start = datetime.datetime.now()
             try:
-                await self._check_all_subscriptions()
+                # 检查是否在休眠时间段
+                if self._is_in_sleep_period():
+                    logger.debug(
+                        f"轮询唤醒，但处于休眠时段 "
+                        f"({self.sleep_start}:00 - {self.sleep_end}:00)，跳过"
+                    )
+                else:
+                    logger.debug(
+                        f"轮询触发 @ {loop_start.strftime('%H:%M:%S')}，"
+                        f"间隔={self.poll_interval}min"
+                    )
+                    await self._check_all_subscriptions()
             except Exception as e:
-                logger.error(f"推文轮询出错: {e}")
+                logger.error(f"推文轮询出错: {e}", exc_info=True)
             await asyncio.sleep(self.poll_interval * 60)
 
     async def _check_all_subscriptions(self):
         """检查所有订阅的新推文"""
         subscribe_list = await self._get_subs()
         if not subscribe_list:
+            logger.debug("轮询: 无订阅，跳过")
             return
+
+        usernames = list(subscribe_list.keys())
+        logger.debug(
+            f"轮询开始: {len(usernames)} 个推主 "
+            f"({', '.join(f'@{u}' for u in usernames)})"
+        )
 
         results: list[bool] = []
         for username, info in subscribe_list.items():
@@ -1106,69 +1342,96 @@ class TwitterPlugin(Star):
                 logger.error(f"检查 {username} 推文失败: {e}")
                 results.append(False)
 
+        success_count = sum(1 for r in results if r)
+        logger.debug(
+            f"轮询结束: {success_count}/{len(results)} 个推主检查成功"
+        )
+
         # 集体转发模式：轮询结束后统一发送缓存的推文
         if self.collective_forward and self._collected_tweets:
             await self._flush_collected_tweets()
 
-        # 自动切换镜像站
-        if not self.custom_nitter_url and results:
-            success_count = sum(1 for r in results if r)
-            if success_count < len(results) / 2 and self.website_list:
-                new_url = get_next_website(
-                    self.website_list, self.twitter_api.nitter_url
-                )
-                if new_url and new_url != self.twitter_api.nitter_url:
-                    logger.info(f"当前镜像站出错过多，切换至: {new_url}")
-                    self.twitter_api.nitter_url = new_url
-
     async def _check_user_tweets(self, username: str, info: dict) -> bool:
-        """检查某个用户的新推文，返回是否成功获取"""
+        """检查某个用户的新推文，使用 advanced_search + since_time 过滤。
+
+        通过 /twitter/tweet/advanced_search 接口，以 since_time（上次轮询时间）
+        作为过滤条件，支持游标分页，确保两次轮询之间的所有推文都被获取，
+        避免 /twitter/user/last_tweets 返回固定数量导致的推文遗漏。
+        """
         try:
-            since_id = info.get("since_id", "")
-            new_tweet_items = await self.twitter_api.get_user_timeline_items(
-                username, since_id
+            # 获取上次成功轮询时间，处理旧订阅的向后兼容
+            last_poll_time = info.get("last_poll_time", 0.0)
+            if not last_poll_time:
+                # 旧订阅（仅有 since_id，无 last_poll_time）→ 初始化为当前时间
+                # 避免首次使用新逻辑时推送大量历史推文
+                last_poll_time = datetime.datetime.now().timestamp()
+                logger.debug(
+                    f"@{username}: 无 last_poll_time（旧订阅），"
+                    f"初始化为当前时间"
+                )
+
+            logger.debug(
+                f"检查 @{username}: since_time={last_poll_time:.0f} "
+                f"({datetime.datetime.fromtimestamp(last_poll_time).strftime('%m-%d %H:%M:%S')})"
             )
 
-            if not new_tweet_items:
+            # 在 API 调用前记录时间，成功后用作新的 last_poll_time
+            # 确保不会遗漏在 API 调用和推送期间发布的新推文
+            poll_start = datetime.datetime.now().timestamp()
+            new_tweets = await self.twitter_api.get_user_tweets_since_time(
+                username, last_poll_time, include_retweets=self.include_retweets
+            )
+
+            if not new_tweets:
+                logger.debug(f"  @{username}: 无新推文")
+                # 无新推文 → 不更新 last_poll_time，下次仍以同一时间点查询
                 return True
+
+            logger.debug(
+                f"  @{username}: 发现 {len(new_tweets)} 条新推文 "
+                f"(ID: {new_tweets[0].get('tweet_id','')[:12]}..."
+                f" ~ {new_tweets[-1].get('tweet_id','')[:12]}...)"
+            )
 
             # 再次确认该推主仍有订阅者（可能在获取推文期间被取关）
             latest_subs = await self._get_subs()
             if username not in latest_subs:
                 logger.info(f"@{username} 已无订阅者，跳过推送")
+                # 无订阅者但仍更新 last_poll_time，避免重复拉取已取关用户的推文
+                subs = await self._get_subs()
+                if username in subs:
+                    subs[username]["last_poll_time"] = poll_start
+                    await self._save_subs(subs)
                 return True
 
-            # 按时间正序（最旧在前）逐条处理
-            # （集体转发模式下缓存，即时模式下直接推送）
-            for item in new_tweet_items:
-                if item.get("is_retweet") and not self.include_retweets:
-                    logger.debug(
-                        f"跳过 @{username} 转帖: {item.get('tweet_id')}"
-                    )
-                    continue
-
-                tweet_id = str(item.get("tweet_id") or "")
-                tweet_username = str(item.get("username") or username)
-                if not tweet_id:
-                    continue
-
-                tweet_info = await self.twitter_api.get_tweet(
-                    tweet_username, tweet_id
-                )
-                self._attach_timeline_item_metadata(tweet_info, item)
+            # 按时间正序（最旧在前）逐条推送
+            for tweet_info in new_tweets:
                 await self._push_tweet_to_subscribers(username, tweet_info, info)
 
-            # 更新 since_id 为最新一条
+            # 推送成功 → 更新 last_poll_time 为 API 调用前的时间
+            # 仅当获取到新推文且成功推送后才更新，确保不会因失败而跳过推文
             subs = await self._get_subs()
             if username in subs:
-                subs[username]["since_id"] = str(
-                    new_tweet_items[-1].get("tweet_id") or since_id
-                )
+                subs[username]["last_poll_time"] = poll_start
                 await self._save_subs(subs)
 
+            # 用最新一条非转帖推文更新缓存（优先非转帖；全转帖时用最后一条）
+            latest_tweet = new_tweets[-1]
+            for t in reversed(new_tweets):
+                if not t.get("retweet"):
+                    latest_tweet = t
+                    break
+            await self._cache_set_tweet(username, latest_tweet)
+
+            logger.debug(
+                f"  @{username}: last_poll_time 已更新为 "
+                f"{datetime.datetime.fromtimestamp(poll_start).strftime('%m-%d %H:%M:%S')}，"
+                f"缓存已刷新"
+            )
             return True
         except Exception as e:
-            logger.error(f"获取 {username} 推文异常: {e}")
+            logger.error(f"获取 {username} 推文异常: {e}", exc_info=True)
+            # 异常时绝不更新 last_poll_time，下次重试仍使用同一时间点
             return False
 
     # ========== 指令处理 ==========
@@ -1176,12 +1439,16 @@ class TwitterPlugin(Star):
     @filter.command("推特关注", alias={"twitter_follow"})
     async def follow_twitter(self, event: AstrMessageEvent, username: str = ""):
         """订阅推主，格式: /推特关注 <推主id> [r18] [媒体]"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self.api_key:
+            yield event.plain_result(
+                "未配置 twitterapi.io API Key，请先在配置中设置"
+            )
             return
 
         if not username:
-            yield event.plain_result("请提供推主ID，用法: /推特关注 <推主ID> [r18] [媒体]")
+            yield event.plain_result(
+                "请提供推主ID，用法: /推特关注 <推主ID> [r18] [媒体]"
+            )
             return
 
         username = username.strip("@").strip()
@@ -1198,9 +1465,8 @@ class TwitterPlugin(Star):
             yield event.plain_result(f"未找到用户: {username}")
             return
 
-        # 获取最新推文 ID 作为 since_id
-        latest_ids = await self.twitter_api.get_user_newtimeline(username)
-        since_id = latest_ids[-1] if latest_ids else ""
+        # 初始化 last_poll_time 为当前时间（首次轮询从此时间点开始）
+        last_poll_time = datetime.datetime.now().timestamp()
 
         umo = event.unified_msg_origin
 
@@ -1215,14 +1481,15 @@ class TwitterPlugin(Star):
         if username not in subs:
             subs[username] = {
                 "screen_name": user_info["screen_name"],
-                "since_id": since_id,
+                "last_poll_time": last_poll_time,
                 "subscribers": {},
             }
 
         subs[username]["subscribers"][umo] = session_config
         subs[username]["screen_name"] = user_info["screen_name"]
-        if since_id:
-            subs[username]["since_id"] = since_id
+        # 已存在订阅：保留原有 last_poll_time，新订阅者从当前时间开始不会收到历史推文
+        if username in subs and "last_poll_time" not in subs[username]:
+            subs[username]["last_poll_time"] = last_poll_time
 
         await self._save_subs(subs)
 
@@ -1241,8 +1508,10 @@ class TwitterPlugin(Star):
     @filter.command("推特批量关注", alias={"twitter_batch_follow"})
     async def batch_follow_twitter(self, event: AstrMessageEvent):
         """批量订阅推主，格式: /推特批量关注 <推主id1> <推主id2> ... [r18] [媒体]"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self.api_key:
+            yield event.plain_result(
+                "未配置 twitterapi.io API Key，请先在配置中设置"
+            )
             return
 
         # 解析消息：提取用户名和选项
@@ -1277,9 +1546,8 @@ class TwitterPlugin(Star):
                     results.append(f"❌ @{username} - 未找到用户")
                     continue
 
-                # 获取最新推文 ID
-                latest_ids = await self.twitter_api.get_user_newtimeline(username)
-                since_id = latest_ids[-1] if latest_ids else ""
+                # 初始化 last_poll_time 为当前时间（首次轮询从此时间点开始）
+                last_poll_time = datetime.datetime.now().timestamp()
 
                 # 添加订阅
                 session_config = {
@@ -1291,14 +1559,14 @@ class TwitterPlugin(Star):
                 if username not in subs:
                     subs[username] = {
                         "screen_name": user_info["screen_name"],
-                        "since_id": since_id,
+                        "last_poll_time": last_poll_time,
                         "subscribers": {},
                     }
 
                 subs[username]["subscribers"][umo] = session_config
                 subs[username]["screen_name"] = user_info["screen_name"]
-                if since_id:
-                    subs[username]["since_id"] = since_id
+                if "last_poll_time" not in subs[username]:
+                    subs[username]["last_poll_time"] = last_poll_time
 
                 success_count += 1
                 r18_str = " | R18" if r18 else ""
@@ -1417,6 +1685,41 @@ class TwitterPlugin(Star):
             f"{total_subscribers} 个订阅关系"
         )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("推特清空缓存", alias={"twitter_clear_cache"})
+    async def clear_cache(self, event: AstrMessageEvent):
+        """清空推文缓存（仅管理员），格式: /推特清空缓存"""
+        cleared = 0
+        try:
+            if self._redis:
+                # 清空 Redis 中所有 twitter:tweet: 前缀的键
+                keys = self._redis.keys(f"{REDIS_KEY_PREFIX}*")
+                if keys:
+                    cleared = len(keys)
+                    self._redis.delete(*keys)
+            else:
+                # 清空内存缓存
+                keys = [
+                    k for k in self._memory_cache
+                    if k.startswith(REDIS_KEY_PREFIX)
+                ]
+                cleared = len(keys)
+                for k in keys:
+                    del self._memory_cache[k]
+        except Exception as e:
+            logger.error(f"清空缓存失败: {e}")
+            yield event.plain_result(f"清空缓存失败: {e}")
+            return
+
+        # 同时清空媒体文件缓存
+        media_cleared = self.twitter_api.clear_media_cache()
+
+        logger.info(f"已清空推文缓存: {cleared} 条, 媒体缓存: {media_cleared} 个文件")
+        yield event.plain_result(
+            f"已清空推文缓存: {cleared} 条\n"
+            f"已清空媒体缓存: {media_cleared} 个文件"
+        )
+
     @filter.command("推特列表", alias={"twitter_list"})
     async def list_follows(self, event: AstrMessageEvent):
         """查看当前订阅的推主列表"""
@@ -1440,9 +1743,10 @@ class TwitterPlugin(Star):
             yield event.plain_result("当前没有订阅任何推主")
             return
 
-        yield event.plain_result("当前订阅列表:\n" + "\n".join(
-            f"{i}. {line}" for i, line in enumerate(lines, 1)
-        ))
+        yield event.plain_result(
+            "当前订阅列表:\n"
+            + "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1))
+        )
 
     @filter.command("推特推送", alias={"twitter_push"})
     async def toggle_push(self, event: AstrMessageEvent, action: str = ""):
@@ -1471,9 +1775,14 @@ class TwitterPlugin(Star):
 
     @filter.command("推特测试", alias={"twitter_test"})
     async def test_tweet(self, event: AstrMessageEvent, username: str = ""):
-        """立即获取并推送指定推主的最新一条推文，格式: /推特测试 <推主id>"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        """立即获取并推送指定推主的最新一条推文，格式: /推特测试 <推主id>
+
+        优先从 Redis 缓存获取，缓存未命中时调用 twitterapi.io。
+        """
+        if not self.api_key:
+            yield event.plain_result(
+                "未配置 twitterapi.io API Key，请先在配置中设置"
+            )
             return
 
         if not username:
@@ -1481,43 +1790,46 @@ class TwitterPlugin(Star):
             return
 
         username = username.strip("@").strip()
-
         umo = event.unified_msg_origin
 
         yield event.plain_result(f"正在获取 @{username} 的最新推文，请稍候...")
 
-        # 获取时间线并按配置选择最新推文
-        timeline_items = await self.twitter_api.get_user_timeline_items(username)
-        if not timeline_items:
-            yield event.plain_result(f"未找到 @{username} 的推文")
-            return
+        tweet_info: dict | None = None
 
-        selected_item = None
-        for item in timeline_items:
-            if item.get("is_retweet") and not self.include_retweets:
-                continue
-            selected_item = item
-            break
+        # 优先从 Redis 缓存获取
+        cached = await self._cache_get_tweet(username)
+        if cached:
+            logger.info(f"命中缓存: {username}")
+            tweet_info = cached
+        else:
+            logger.info(f"缓存未命中: {username}，调用 twitterapi.io")
 
-        if not selected_item:
-            yield event.plain_result(f"未找到 @{username} 的非转贴推文")
-            return
+        # 缓存未命中，从 API 获取最新 1 条推文（仅 1 次 API 调用）
+        if not tweet_info:
+            new_tweets = await self.twitter_api.get_user_new_tweets_parsed(
+                username, include_retweets=self.include_retweets, limit=1
+            )
+            if not new_tweets:
+                yield event.plain_result(f"未找到 @{username} 的推文")
+                return
 
-        tweet_id = str(selected_item.get("tweet_id") or "")
-        tweet_username = str(selected_item.get("username") or username)
+            tweet_info = new_tweets[0]
 
-        # 获取推文详情
-        tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
-        self._attach_timeline_item_metadata(tweet_info, selected_item)
+            # 更新缓存
+            await self._cache_set_tweet(username, tweet_info)
 
-        # 翻译推文
+        # 翻译推文（如果翻译已缓存在 tweet_info 中则跳过 LLM 调用）
         translated_text, translate_model = await self._maybe_translate(
             tweet_info, umo
         )
 
+        # 将翻译结果持久化到缓存（下次命中时跳过 API + LLM + 媒体下载）
+        await self._cache_set_tweet(username, tweet_info)
+
         # 构建并返回消息
         chain = await self._build_tweet_message_chain(
-            username, tweet_info,
+            username,
+            tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
         )
@@ -1576,7 +1888,7 @@ class TwitterPlugin(Star):
 
         logger.info(f"检测到推文链接: {link}")
 
-        if not self.twitter_api.nitter_url:
+        if not self.api_key:
             return
 
         try:
@@ -1613,7 +1925,9 @@ class TwitterPlugin(Star):
                     for vid_comp in video_parts:
                         await self._send_video_or_fallback(umo, vid_comp)
                 except Exception:
-                    plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+                    plain_chain, video_parts = self._split_plain_chain_and_videos(
+                        chain
+                    )
                     if plain_chain:
                         yield event.chain_result(plain_chain)
                     for vid_comp in video_parts:

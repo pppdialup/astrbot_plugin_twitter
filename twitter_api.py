@@ -429,9 +429,18 @@ class TwitterAPI:
         return images, videos, video_previews
 
     def _parse_quote(self, quoted_tweet: dict) -> dict | None:
-        """解析引用推文为插件内部格式。"""
+        """解析引用推文为插件内部格式。
+
+        若引用的推文是转推，向下处理一层，使用原始推文的内容，
+        但不再处理该原始推文所引用的推文。
+        """
         if not quoted_tweet:
             return None
+
+        # 若引用推文是转推，向下处理一层，使用原始推文内容
+        inner_retweet = quoted_tweet.get("retweeted_tweet")
+        if inner_retweet:
+            quoted_tweet = inner_retweet
 
         author = quoted_tweet.get("author") or {}
         quote_username = author.get("userName", "")
@@ -460,6 +469,11 @@ class TwitterAPI:
     ) -> dict:
         """将 twitterapi.io 推文数据映射为插件内部统一格式。
 
+        推文有 3 种类型，均只向下处理一层：
+          1. 直接推文：retweeted_tweet=None, quoted_tweet=None → 返回推文本身
+          2. 转推：retweeted_tweet!=None → 使用被转推文内容，不解析其 quoted_tweet
+          3. 引用推文：quoted_tweet!=None → 解析引用推文一层，不递归
+
         参数:
             tweet: twitterapi.io 返回的推文对象
             fallback_username: 无 author 信息时的回退用户名
@@ -471,8 +485,10 @@ class TwitterAPI:
 
         # 处理转推（retweeted_tweet）
         retweet = None
+        is_retweet = False
         retweeted_tweet = tweet.get("retweeted_tweet")
         if retweeted_tweet:
+            is_retweet = True
             retweet = {
                 "retweeter_username": author.get("userName", fallback_username),
                 "retweeter_screen_name": author.get("name", ""),
@@ -514,8 +530,11 @@ class TwitterAPI:
         media_list = extended_entities.get("media", [])
         images, videos, video_previews = self._parse_media(media_list)
 
-        # 引用推文
-        quote = self._parse_quote(tweet.get("quoted_tweet") or None)
+        # 引用推文：转推时不向下处理被转推文所引用的推文（仅一层）
+        if is_retweet:
+            quote = None
+        else:
+            quote = self._parse_quote(tweet.get("quoted_tweet") or None)
 
         return {
             "tweet_id": tweet_id,
@@ -686,8 +705,11 @@ class TwitterAPI:
             return []
 
         # 构建查询：from:用户名 since_time:Unix时间戳
+        # from: 操作符默认排除 native retweets，需要显式 include:nativeretweets 才能获取
         query = f"from:{username} since_time:{int(since_time)}"
-        if not include_retweets:
+        if include_retweets:
+            query += " include:nativeretweets"
+        else:
             query += " -filter:retweets"
 
         all_tweets: list[dict] = []

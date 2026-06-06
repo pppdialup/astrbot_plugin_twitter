@@ -371,8 +371,9 @@ class TwitterAPI:
         """从 twitterapi.io 的 extendedEntities.media 解析图片、视频和视频封面。
 
         twitterapi.io 返回的 media 对象可能不含 type 字段，需要通过其他字段区分：
-        - 图片: media_url_https 存在，无 videoInfo
-        - 视频: videoInfo.variants[] 存在，或 ext_master_playlist_only 有内容
+        - 图片: media_url_https 存在，无 videoInfo/video_info
+        - 视频: videoInfo.variants[] 或 video_info.variants[] 存在，
+          或 ext_master_playlist_only 有内容，或 type="video"
 
         返回:
             (images, videos, video_previews)
@@ -383,15 +384,18 @@ class TwitterAPI:
 
         for media in media_list:
             media_url = media.get("media_url_https", "")
-            video_info = media.get("videoInfo") or {}
+            # 同时支持 camelCase videoInfo (twitterapi.io) 和 snake_case video_info (search API/result.json)
+            video_info = media.get("videoInfo") or media.get("video_info") or {}
             ext_playlists = media.get("ext_playlists") or []
             ext_master_playlist = media.get("ext_master_playlist_only") or []
+            media_type = media.get("type", "")
 
-            # 判断是否为视频：有 videoInfo.variants 或 ext_master_playlist_only 非空
-            is_video = bool(
-                video_info.get("variants")
-                or ext_master_playlist
-                or ext_playlists
+            # 判断是否为视频：type=video 或 video_info 有 variants 或 ext_master_playlist_only 非空
+            is_video = (
+                media_type == "video"
+                or bool(video_info.get("variants"))
+                or bool(ext_master_playlist)
+                or bool(ext_playlists)
             )
 
             if is_video:

@@ -173,18 +173,11 @@ class TwitterAPI:
             logger.debug(f"Range 探测远程文件大小失败: {url}, {e}")
             return None
 
-    async def download_media(
-        self, url: str, suffix: str = ".jpg", timeout: float = 60.0
-    ) -> str | None:
+    async def download_media(self, url: str, suffix: str = ".jpg") -> str | None:
         """通过代理下载媒体文件到本地缓存，返回本地路径。
 
         优先从本地媒体缓存读取；缓存未命中时通过 HTTP 下载并存入缓存。
         用于解决 AstrBot 直连 Twitter CDN 超时的问题。
-
-        参数:
-            url: 媒体文件 URL
-            suffix: 文件后缀（默认 .jpg）
-            timeout: 下载超时时间（秒），视频文件建议使用更长超时（如 300）
 
         返回:
             本地文件路径（缓存或下载），失败返回 None
@@ -204,7 +197,7 @@ class TwitterAPI:
 
         client = httpx.AsyncClient(
             proxy=proxy,
-            timeout=timeout,
+            timeout=60.0,
             follow_redirects=True,
             headers={
                 "User-Agent": (
@@ -219,7 +212,7 @@ class TwitterAPI:
             last_error = None
             for attempt in range(2):
                 try:
-                    resp = await client.get(url, timeout=timeout)
+                    resp = await client.get(url, timeout=60.0)
                     if resp.status_code != 200:
                         logger.warning(
                             f"下载媒体失败 (尝试 {attempt + 1}/2): {url[:60]}..., "
@@ -390,24 +383,15 @@ class TwitterAPI:
 
         for media in media_list:
             media_url = media.get("media_url_https", "")
-            # 兼容 twitterapi.io (camelCase: videoInfo) 和 search API (snake_case: video_info)
-            video_info = (
-                media.get("videoInfo")
-                or media.get("video_info")
-                or {}
-            )
+            video_info = media.get("videoInfo") or {}
             ext_playlists = media.get("ext_playlists") or []
             ext_master_playlist = media.get("ext_master_playlist_only") or []
 
-            # 判断是否为视频：type=video 或存在 videoInfo/video_info.variants
-            # 或 ext_master_playlist_only 非空
-            is_video = (
-                media.get("type") == "video"
-                or bool(
-                    video_info.get("variants")
-                    or ext_master_playlist
-                    or ext_playlists
-                )
+            # 判断是否为视频：有 videoInfo.variants 或 ext_master_playlist_only 非空
+            is_video = bool(
+                video_info.get("variants")
+                or ext_master_playlist
+                or ext_playlists
             )
 
             if is_video:

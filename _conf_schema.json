@@ -28,12 +28,6 @@
         "type": "int",
         "default": 5,
         "hint": "建议不低于 3 分钟，避免频繁请求消耗 API 额度"
-      },
-      "twitter_poll_thread_count": {
-        "description": "定时任务并发线程数量",
-        "type": "int",
-        "default": 4,
-        "hint": "将推主列表分组并发检查，每组内仍保持 3 秒间隔。设为 1 则为串行模式"
       }
     }
   },
@@ -53,30 +47,6 @@
         "type": "int",
         "default": 8,
         "hint": "如设为 8 表示早上 8:00 结束休眠。若与开始时间相同则不启用休眠"
-      },
-      "twitter_scheduled_push_times": {
-        "description": "定时推送时间点（留空则仅使用间隔轮询）",
-        "type": "string",
-        "default": "",
-        "hint": "多个时间点用英文逗号分隔，24小时制，中国时间。如 08:00:00,12:00:00,20:00:00"
-      },
-      "twitter_push_prepare_minutes": {
-        "description": "推送前多长时间开始获取并处理推文（分钟）",
-        "type": "int",
-        "default": 30,
-        "hint": "在推送时间点前 N 分钟开始调用 API 获取最新推文并处理"
-      },
-      "twitter_push_advance_seconds": {
-        "description": "推送前多长时间开始发送消息（秒）",
-        "type": "int",
-        "default": 0,
-        "hint": "在推送时间点前 N 秒开始发送。设为 0 则准时发送"
-      },
-      "twitter_since_time_override": {
-        "description": "重载时覆盖所有推主的 since_time（Unix 时间戳，0=禁用）",
-        "type": "int",
-        "default": 0,
-        "hint": "部署测试用。配置后重载插件会将所有推主的 last_poll_time 同步为此值，用于从指定时间点开始拉取推文。设为 0 则按默认逻辑初始化"
       }
     }
   },

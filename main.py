@@ -211,29 +211,6 @@ class TwitterPlugin(Star):
         # 如果开始和结束相同，则不启用休眠
         self._sleep_enabled = self.sleep_start != self.sleep_end
 
-        # 多线程并发轮询配置
-        self.poll_thread_count = max(
-            1, int(self._cfg("basic", "twitter_poll_thread_count", 4))
-        )
-
-        # 定时时间点推送配置
-        raw_scheduled_times = str(
-            self._cfg("schedule", "twitter_scheduled_push_times", "")
-            or ""
-        ).strip()
-        self.scheduled_push_times = raw_scheduled_times
-        self.push_prepare_minutes = max(
-            1, int(self._cfg("schedule", "twitter_push_prepare_minutes", 30))
-        )
-        self.push_advance_seconds = max(
-            0, int(self._cfg("schedule", "twitter_push_advance_seconds", 0))
-        )
-
-        # since_time 覆盖（部署测试用，0=禁用）
-        self.since_time_override = max(
-            0, int(self._cfg("schedule", "twitter_since_time_override", 0))
-        )
-
         # 读取 Redis 配置
         self.redis_host = str(
             self._cfg("redis", "twitter_redis_host", "127.0.0.1")
@@ -256,15 +233,10 @@ class TwitterPlugin(Star):
 
         # 定时任务句柄
         self._poll_task: asyncio.Task | None = None
-        self._scheduled_task: asyncio.Task | None = None
         self._running = False
-        self._poll_lock = asyncio.Lock()  # 防止并发轮询
-        self._collected_tweets_lock = asyncio.Lock()  # 保护集体转发缓存的并发写入
 
         # 集体转发推文缓存：{umo: [CachedTweet, ...]}
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
-        # 定时推送模式下强制缓存推文（即使 collective_forward=False）
-        self._force_collect = False
 
     # ========== Redis 缓存管理 ==========
 
@@ -356,62 +328,6 @@ class TwitterPlugin(Star):
             # 跨日区间，如 22:00 - 6:00
             return current_hour >= self.sleep_start or current_hour < self.sleep_end
 
-    # ========== 定时推送时间点计算 ==========
-
-    def _parse_scheduled_times(self) -> list[datetime.time]:
-        """解析配置中的定时推送时间点字符串为 time 列表。
-
-        配置格式: "HH:MM:SS,HH:MM:SS,..."（逗号分隔，24小时制，中国时间）
-
-        返回:
-            排序后的 time 列表，配置为空时返回空列表
-        """
-        raw = self.scheduled_push_times.strip()
-        if not raw:
-            return []
-        times: list[datetime.time] = []
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                h, m, s = part.split(":")
-                times.append(datetime.time(int(h), int(m), int(s)))
-            except (ValueError, TypeError) as e:
-                logger.warning(f"解析定时推送时间失败: {part!r}, {e}")
-        times.sort()
-        return times
-
-    @staticmethod
-    def _calculate_next_push_time(
-        now: datetime.datetime, scheduled_times: list[datetime.time]
-    ) -> datetime.datetime | None:
-        """计算下一个推送时间点。
-
-        参数:
-            now: 当前时间（必须包含时区信息）
-            scheduled_times: 已排序的 time 列表
-
-        返回:
-            下一个推送时间点（含时区），无有效配置则返回 None
-        """
-        if not scheduled_times:
-            return None
-
-        today = now.date()
-        for t in scheduled_times:
-            push_dt = datetime.datetime.combine(
-                today, t, tzinfo=now.tzinfo
-            )
-            if push_dt > now:
-                return push_dt
-
-        # 所有时间点今天已过 → 返回明天第一个
-        tomorrow = today + datetime.timedelta(days=1)
-        return datetime.datetime.combine(
-            tomorrow, scheduled_times[0], tzinfo=now.tzinfo
-        )
-
     # ========== 生命周期 ==========
 
     async def initialize(self):
@@ -452,63 +368,17 @@ class TwitterPlugin(Star):
                     "推文功能可能不可用"
                 )
 
-        # since_time 覆盖：将全部推主的 last_poll_time 同步为配置值
-        if self.since_time_override > 0:
-            subs = await self._get_subs()
-            if subs:
-                override_ts = float(self.since_time_override)
-                for username, info in subs.items():
-                    old_time = info.get("last_poll_time", 0)
-                    info["last_poll_time"] = override_ts
-                    logger.info(
-                        f"since_time 覆盖 @{username}: "
-                        f"{old_time:.0f} → {override_ts:.0f} "
-                        f"({datetime.datetime.fromtimestamp(override_ts).strftime('%Y-%m-%d %H:%M:%S')})"
-                    )
-                await self._save_subs(subs)
-                logger.info(
-                    f"since_time 覆盖完成: {len(subs)} 个推主已同步到 "
-                    f"{datetime.datetime.fromtimestamp(override_ts).strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-            else:
-                logger.info("since_time 覆盖: 当前无订阅，跳过")
-
-        # 启动定时任务
+        # 启动定时轮询任务
         if self.api_key:
             self._running = True
-
-            # 检查是否配置了定时推送时间点
-            has_scheduled_push = bool(
-                self.scheduled_push_times and self._parse_scheduled_times()
-            )
-
-            if has_scheduled_push:
-                # 使用定时时间点推送（不启动间隔轮询，避免浪费 API 额度）
-                self._scheduled_task = asyncio.create_task(
-                    self._scheduled_push_worker()
-                )
-                times = self._parse_scheduled_times()
-                times_str = ", ".join(
-                    t.strftime("%H:%M:%S") for t in times
-                )
+            self._poll_task = asyncio.create_task(self._poll_tweets())
+            if self._sleep_enabled:
                 logger.info(
-                    f"定时时间点推送已启用: {times_str}, "
-                    f"提前 {self.push_prepare_minutes} 分钟获取, "
-                    f"提前 {self.push_advance_seconds} 秒发送, "
-                    f"间隔轮询已停用"
+                    f"推文轮询已启动，间隔 {self.poll_interval} 分钟，"
+                    f"休眠时段: {self.sleep_start}:00 - {self.sleep_end}:00"
                 )
             else:
-                # 使用间隔轮询
-                self._poll_task = asyncio.create_task(self._poll_tweets())
-                if self._sleep_enabled:
-                    logger.info(
-                        f"推文轮询已启动，间隔 {self.poll_interval} 分钟，"
-                        f"休眠时段: {self.sleep_start}:00 - {self.sleep_end}:00"
-                    )
-                else:
-                    logger.info(
-                        f"推文轮询已启动，间隔 {self.poll_interval} 分钟"
-                    )
+                logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
 
         logger.info("Twitter 推文转发插件初始化完成")
 
@@ -519,12 +389,6 @@ class TwitterPlugin(Star):
             self._poll_task.cancel()
             try:
                 await self._poll_task
-            except asyncio.CancelledError:
-                pass
-        if self._scheduled_task:
-            self._scheduled_task.cancel()
-            try:
-                await self._scheduled_task
             except asyncio.CancelledError:
                 pass
         # 停止前发送缓存的推文，避免丢失
@@ -588,25 +452,6 @@ class TwitterPlugin(Star):
                 "retweeter_username": str(item.get("retweeter_username") or ""),
                 "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
             }
-
-    @staticmethod
-    def _split_into_groups(items: list, group_count: int) -> list[list]:
-        """将列表均匀分配到 group_count 个组中（轮询分配）。
-
-        例如: items=[a,b,c,d,e], group_count=3 → [[a,d],[b,e],[c]]
-
-        返回:
-            分组后的列表，自动移除空组
-        """
-        if not items:
-            return []
-        if group_count < 1:
-            group_count = 1
-        groups: list[list] = [[] for _ in range(group_count)]
-        for i, item in enumerate(items):
-            groups[i % group_count].append(item)
-        # 移除空组（当 items 数量少于 group_count 时）
-        return [g for g in groups if g]
 
     @staticmethod
     def _tweet_has_media(tweet_info: dict) -> bool:
@@ -680,39 +525,12 @@ class TwitterPlugin(Star):
         for v_url in videos:
             video_url = str(v_url)
             try:
-                # 跳过流媒体清单 URL（不可直接下载）
-                if self._is_stream_video_url(video_url):
-                    logger.debug(
-                        f"{context_label}跳过流媒体清单: {video_url[:80]}..."
-                    )
-                    continue
-
-                # 优先尝试下载视频到本地缓存
-                local_path = await self.twitter_api.download_media(
-                    video_url, suffix=".mp4", timeout=300.0
-                )
-                if local_path:
-                    video_comp = Comp.Video.fromFileSystem(local_path)
-                    if video_comp is not None:
-                        chain.append(video_comp)
-                        logger.debug(
-                            f"{context_label}视频已缓存并发送: "
-                            f"{video_url[:60]}..."
-                        )
-                        continue
-                    else:
-                        logger.warning(
-                            f"{context_label}视频文件加载失败: {local_path}"
-                        )
-
-                # 本地缓存不可用，回退到 URL 直发
                 exceeds_limit, size_bytes = await self._video_exceeds_size_limit(
                     video_url
                 )
                 if exceeds_limit:
                     logger.warning(
-                        f"{context_label}视频超过大小限制，已改为链接: "
-                        f"{video_url[:60]}..."
+                        f"{context_label}视频超过大小限制，已改为链接: {video_url}"
                     )
                     chain.append(
                         Comp.Plain(
@@ -726,77 +544,9 @@ class TwitterPlugin(Star):
                     chain.append(video_comp)
             except Exception as e:
                 logger.warning(
-                    f"添加{context_label}视频失败，回退为链接: "
-                    f"{video_url[:60]}..., {e}"
+                    f"添加{context_label}视频失败，回退为链接: {video_url}, {e}"
                 )
                 chain.append(Comp.Plain(str(f"\n视频: {video_url}")))
-
-    async def _prefetch_tweet_media(self, tweet_info: dict):
-        """预下载推文的媒体文件到本地缓存（准备阶段调用）。
-
-        下载前先检查本地缓存，已缓存的跳过不重复下载。
-        在缓存推文时提前下载图片和视频到本地，
-        避免发送阶段才下载导致延迟不可控。
-
-        参数:
-            tweet_info: 推文信息字典
-        """
-        media_urls: list[tuple[str, str, float]] = []
-        # 收集所有媒体 URL: (url, suffix, timeout)
-
-        for img_url in tweet_info.get("images") or []:
-            url = str(img_url)
-            if url:
-                media_urls.append((url, ".jpg", 60.0))
-
-        for vid_url in tweet_info.get("videos") or []:
-            url = str(vid_url)
-            if url and not self._is_stream_video_url(url):
-                media_urls.append((url, ".mp4", 300.0))
-
-        quote = tweet_info.get("quote") or {}
-        for img_url in quote.get("images") or []:
-            url = str(img_url)
-            if url:
-                media_urls.append((url, ".jpg", 60.0))
-        for vid_url in quote.get("videos") or []:
-            url = str(vid_url)
-            if url and not self._is_stream_video_url(url):
-                media_urls.append((url, ".mp4", 300.0))
-
-        if not media_urls:
-            return
-
-        # 过滤掉已缓存的 URL
-        uncached: list[tuple[str, str, float]] = []
-        for url, suffix, timeout in media_urls:
-            cache_key = self.twitter_api._media_cache_key(url)
-            if self.twitter_api._get_from_media_cache(cache_key):
-                logger.debug(f"预下载跳过（已缓存）: {url[:60]}...")
-            else:
-                uncached.append((url, suffix, timeout))
-
-        if not uncached:
-            logger.debug(
-                f"预下载: 全部 {len(media_urls)} 个媒体文件已缓存，跳过下载"
-            )
-            return
-
-        logger.debug(
-            f"预下载: {len(uncached)}/{len(media_urls)} 个媒体文件需要下载"
-        )
-
-        # 并发下载未缓存的文件
-        async def _download_one(url: str, suffix: str, timeout: float):
-            try:
-                await self.twitter_api.download_media(url, suffix, timeout)
-            except Exception as e:
-                logger.debug(f"预下载媒体失败 ({url[:60]}...): {e}")
-
-        await asyncio.gather(
-            *[_download_one(url, suf, to) for url, suf, to in uncached],
-            return_exceptions=True,
-        )
 
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
@@ -1183,20 +933,21 @@ class TwitterPlugin(Star):
 
     def _split_chain_for_nodes(
         self, chain: list, nickname: str
-    ) -> list[Node]:
-        """将消息链转换为 Node 列表（视频和图片均放入 Node 中）。
+    ) -> tuple[list[Node], list[Comp.Video]]:
+        """将消息链分离为 Node 列表和待独立发送的视频列表
 
-        由于准备阶段已预下载媒体到本地缓存，视频使用本地文件，
-        可以放入 Node 中发送，不再需要独立发送。
+        视频不能放在 Node 中，否则下载+上传会超出 WebSocket API 超时时间，
+        需要作为独立消息发送。
 
         参数:
             chain: _build_tweet_chain 生成的消息链
             nickname: Node 显示的昵称
 
         返回:
-            Node 列表
+            (Node 列表, 待独立发送的视频组件列表)
         """
         nodes: list[Node] = []
+        video_parts: list[Comp.Video] = []
         text_parts: list = []
 
         def flush_text_parts():
@@ -1206,7 +957,9 @@ class TwitterPlugin(Star):
                 text_parts = []
 
         for comp in chain:
-            if isinstance(comp, (Comp.Video, Comp.Image)):
+            if isinstance(comp, Comp.Video):
+                video_parts.append(comp)
+            elif isinstance(comp, Comp.Image):
                 flush_text_parts()
                 nodes.append(Node(content=[comp], name=nickname))
             else:
@@ -1216,7 +969,7 @@ class TwitterPlugin(Star):
         if text_parts:
             nodes.append(Node(content=text_parts, name=nickname))
 
-        return nodes
+        return nodes, video_parts
 
     @staticmethod
     def _build_plain_chain(chain: list) -> list:
@@ -1267,64 +1020,6 @@ class TwitterPlugin(Star):
                         chain=[Comp.Plain(str(f"视频: {vid_url}"))]
                     ),
                 )
-
-    async def _send_merged_nodes_with_retry(
-        self,
-        umo: str,
-        nodes: list,
-    ) -> None:
-        """将全部节点通过合并转发消息发送，自动拆分过大的消息。
-
-        采用迭代折半法：将所有剩余节点作为一个合并消息尝试发送，
-        若失败则折半重试，直到找到能成功发送的 batch。
-        发送成功后继续用同样方式处理剩余节点，直到全部发完。
-
-        示例（14 个节点）:
-        - 全部 14 成功 → 1 条合并消息
-        - 14 失败 → 折半 7 成功 → 剩余 7 成功 → 2 条合并消息 [7,7]
-        - 7 失败 → 折半 3 成功 → 剩余 4 成功 → 再处理剩余 7 → [3,4,7]
-        - 7 也失败 → 整体序列 [3,4,3,4] → 4 条合并消息
-
-        参数:
-            umo: 目标会话
-            nodes: 待发送的 Node 列表
-        """
-        if not nodes:
-            return
-
-        remaining = list(nodes)
-        batch_seq: list[int] = []  # 记录每批发出的节点数
-
-        while remaining:
-            size = len(remaining)
-            # 从当前大小开始折半，直到找到可成功发送的 batch size
-            while True:
-                try:
-                    batch = remaining[:size]
-                    message_chain = MessageChain(chain=[Nodes(batch)])
-                    await self.context.send_message(umo, message_chain)
-                    # 发送成功
-                    batch_seq.append(size)
-                    logger.debug(f"合并转发成功: {size} 个节点")
-                    remaining = remaining[size:]
-                    break
-                except Exception as e:
-                    if size <= 1:
-                        logger.error(
-                            f"单节点合并消息发送失败，跳过: {e}"
-                        )
-                        remaining = remaining[1:]
-                        break
-                    logger.debug(
-                        f"合并转发 {size} 个节点失败 → 折半重试: {e}"
-                    )
-                    size = max(1, size // 2)
-
-        if batch_seq:
-            logger.info(
-                f"合并转发完成: {len(nodes)} 个节点 → "
-                f"{len(batch_seq)} 条消息 {batch_seq}"
-            )
 
     async def _push_tweet_to_subscribers(
         self, username: str, tweet_info: dict, user_info: dict
@@ -1384,24 +1079,20 @@ class TwitterPlugin(Star):
             ):
                 continue
 
-            # 集体转发模式（或定时推送强制缓存）：缓存推文，统一发送
-            if self._force_collect or (self.collective_forward and self.use_node):
-                # 准备阶段预下载媒体文件到本地缓存，避免发送阶段耗时
-                await self._prefetch_tweet_media(tweet_info)
-
-                async with self._collected_tweets_lock:
-                    if umo not in self._collected_tweets:
-                        self._collected_tweets[umo] = []
-                    self._collected_tweets[umo].append(
-                        CachedTweet(
-                            username=username,
-                            tweet_info=tweet_info,
-                            sub_config=sub_config,
-                            nickname=nickname,
-                            translated_text=translated_text,
-                            translate_model=translate_model,
-                        )
+            # 集体转发模式：缓存推文，轮询结束后统一发送
+            if self.collective_forward and self.use_node:
+                if umo not in self._collected_tweets:
+                    self._collected_tweets[umo] = []
+                self._collected_tweets[umo].append(
+                    CachedTweet(
+                        username=username,
+                        tweet_info=tweet_info,
+                        sub_config=sub_config,
+                        nickname=nickname,
+                        translated_text=translated_text,
+                        translate_model=translate_model,
                     )
+                )
                 continue
 
             # 即时推送模式
@@ -1438,13 +1129,18 @@ class TwitterPlugin(Star):
                 return
 
             if self.use_node:
-                # 合并转发模式：视频和图片均放入 Node 中
+                # 合并转发模式：使用 Node/Nodes 构建合并转发消息
                 try:
-                    nodes = self._split_chain_for_nodes(chain, nickname)
+                    nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
 
+                    # 发送合并转发消息（文本+图片）
                     if nodes:
                         message_chain = MessageChain(chain=[Nodes(nodes)])
                         await self.context.send_message(umo, message_chain)
+
+                    # 视频作为独立消息逐条发送
+                    for vid_comp in video_parts:
+                        await self._send_video_or_fallback(umo, vid_comp)
 
                 except Exception as node_err:
                     # 合并转发失败，回退到普通消息链（视频改为链接）
@@ -1471,10 +1167,8 @@ class TwitterPlugin(Star):
         if not self._collected_tweets:
             return
 
-        # 原子地取出并清空缓存，防止并发写入导致推文丢失
-        async with self._collected_tweets_lock:
-            collected = self._collected_tweets
-            self._collected_tweets = {}
+        collected = self._collected_tweets
+        self._collected_tweets = {}
 
         # 实时读取最新订阅数据，用于校验每个 UMO 是否仍为有效订阅者
         latest_subs = await self._get_subs()
@@ -1522,6 +1216,7 @@ class TwitterPlugin(Star):
 
                 for batch_idx, batch_authors in enumerate(author_batches):
                     nodes: list[Node] = []
+                    video_queue: list[Comp.Video] = []
 
                     for author in batch_authors:
                         for ct in seen_authors[author]:
@@ -1535,23 +1230,51 @@ class TwitterPlugin(Star):
                             if not chain:
                                 continue
 
-                            ct_nodes = self._split_chain_for_nodes(
+                            ct_nodes, ct_videos = self._split_chain_for_nodes(
                                 chain, ct.nickname
                             )
                             nodes.extend(ct_nodes)
+                            video_queue.extend(ct_videos)
 
-                    # 发送合并转发消息（视频已在 Node 中，无需独立发送）
+                    # 发送合并转发消息
                     if nodes:
                         batch_label = ""
                         if len(author_batches) > 1:
                             batch_label = (
                                 f"（第{batch_idx + 1}/{len(author_batches)}批）"
                             )
-                        await self._send_merged_nodes_with_retry(umo, nodes)
-                        logger.info(
-                            f"集体转发已推送至 {umo} "
-                            f"{batch_label}共 {len(nodes)} 个节点"
-                        )
+                        try:
+                            message_chain = MessageChain(chain=[Nodes(nodes)])
+                            await self.context.send_message(umo, message_chain)
+                            logger.info(
+                                f"集体转发已推送至 {umo} "
+                                f"{batch_label}共 {len(nodes)} 个节点"
+                            )
+                        except Exception as node_err:
+                            logger.warning(
+                                f"集体合并转发失败，回退逐条发送: {node_err}"
+                            )
+                            # 回退：逐条发送
+                            for ct in [
+                                ct
+                                for a in batch_authors
+                                for ct in seen_authors[a]
+                            ]:
+                                await self._send_tweet_to_subscriber(
+                                    umo,
+                                    ct.username,
+                                    ct.tweet_info,
+                                    ct.sub_config,
+                                    ct.nickname,
+                                    translated_text=ct.translated_text,
+                                    translate_model=ct.translate_model,
+                                )
+                            # 回退模式下跳过独立视频发送（已在逐条发送中处理）
+                            video_queue.clear()
+
+                    # 逐条发送视频（独立消息，避免超时）
+                    for vid_comp in video_queue:
+                        await self._send_video_or_fallback(umo, vid_comp)
 
             except Exception as e:
                 logger.error(f"集体转发推送至 {umo} 失败: {e}")
@@ -1572,137 +1295,11 @@ class TwitterPlugin(Star):
                             f"集体转发回退逐条发送也失败: {fallback_err}"
                         )
 
-    # ========== 定时推送 ==========
-
-    async def _scheduled_push_worker(self):
-        """定时时间点推送工作协程。
-
-        在配置的时间点前 prepare_minutes 开始获取推文，
-        在配置的时间点前 advance_seconds 开始发送消息。
-        使用中国时区 (UTC+8) 计算时间。
-
-        防遗漏机制：若因上一轮推送耗时而错过下一个时间点，
-        检测到当前时间 >= 推送时间点时立即执行推送，不会跳过。
-        """
-        logger.debug("定时时间点推送工作协程已启动")
-
-        CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
-
-        while self._running:
-            try:
-                scheduled_times = self._parse_scheduled_times()
-                if not scheduled_times:
-                    await asyncio.sleep(60)
-                    continue
-
-                now = datetime.datetime.now(CHINA_TZ)
-                next_push = self._calculate_next_push_time(now, scheduled_times)
-                if next_push is None:
-                    await asyncio.sleep(60)
-                    continue
-
-                prepare_time = next_push - datetime.timedelta(
-                    minutes=self.push_prepare_minutes
-                )
-                send_time = next_push - datetime.timedelta(
-                    seconds=self.push_advance_seconds
-                )
-
-                now = datetime.datetime.now(CHINA_TZ)
-
-                # 防遗漏：若当前时间已超过推送时间点（如上一轮推送延迟导致），
-                # 立即执行推送，不跳过
-                if now >= next_push:
-                    logger.info(
-                        f"定时推送: 当前时间 {now.strftime('%H:%M:%S')} "
-                        f">= 推送时间 {next_push.strftime('%H:%M:%S')}，立即推送"
-                    )
-                    await self._do_scheduled_push_cycle(send_time)
-                    continue
-
-                # 若当前时间已过准备时间但未到推送时间，立即开始获取
-                if now >= prepare_time:
-                    logger.info(
-                        f"定时推送: 已过准备时间 {prepare_time.strftime('%H:%M:%S')}，"
-                        f"立即开始获取，等待 {send_time.strftime('%H:%M:%S')} 发送"
-                    )
-                else:
-                    # 等待到准备时间
-                    wait_secs = (prepare_time - now).total_seconds()
-                    logger.info(
-                        f"定时推送: 下次推送 {next_push.strftime('%H:%M:%S')}, "
-                        f"准备时间 {prepare_time.strftime('%H:%M:%S')}, "
-                        f"等待 {wait_secs:.0f} 秒"
-                    )
-                    await asyncio.sleep(wait_secs)
-
-                # 检查休眠时段
-                if self._is_in_sleep_period():
-                    logger.debug("定时推送准备时处于休眠时段，跳过本轮")
-                    await asyncio.sleep(60)
-                    continue
-
-                await self._do_scheduled_push_cycle(send_time)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._force_collect = False
-                logger.error(f"定时推送工作协程错误: {e}", exc_info=True)
-                await asyncio.sleep(60)
-
-    async def _do_scheduled_push_cycle(self, send_time: datetime.datetime):
-        """执行一次定时推送周期：获取推文 → 等待发送时间 → 统一发送。
-
-        参数:
-            send_time: 计划发送时间（含中国时区）
-        """
-        CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
-
-        # === Phase 1: 获取和处理推文（仅缓存，不发送） ===
-        logger.info(f"定时推送: 开始获取推文")
-
-        async with self._collected_tweets_lock:
-            self._collected_tweets.clear()
-
-        self._force_collect = True
-        fetch_task = asyncio.create_task(
-            self._check_all_subscriptions(flush_collected=False)
-        )
-
-        # === Phase 2: 等待到发送开始时间 ===
-        now = datetime.datetime.now(CHINA_TZ)
-        wait_send = (send_time - now).total_seconds()
-        if wait_send > 0:
-            logger.debug(f"定时推送: 等待 {wait_send:.0f} 秒到发送时间")
-            await asyncio.sleep(wait_send)
-        else:
-            logger.debug(
-                f"定时推送: 发送时间已到（延迟 {-wait_send:.0f} 秒），立即发送"
-            )
-
-        # 等待获取任务完成
-        await fetch_task
-
-        # === Phase 3: 统一发送所有缓存的推文 ===
-        if self._collected_tweets:
-            total_tweets = sum(
-                len(v) for v in self._collected_tweets.values()
-            )
-            logger.info(f"定时推送: 开始发送，共 {total_tweets} 条推文")
-            await self._flush_collected_tweets()
-        else:
-            logger.info("定时推送: 无缓存推文需要发送")
-
-        self._force_collect = False
-        logger.info("定时推送: 完成本轮")
-
     # ========== 定时轮询 ==========
 
     async def _poll_tweets(self):
-        """定时轮询推文（仅在未配置定时推送时间点时运行）"""
+        """定时轮询推文"""
         logger.debug("推文轮询任务已启动（后台协程）")
-
         while self._running:
             loop_start = datetime.datetime.now()
             try:
@@ -1722,90 +1319,37 @@ class TwitterPlugin(Star):
                 logger.error(f"推文轮询出错: {e}", exc_info=True)
             await asyncio.sleep(self.poll_interval * 60)
 
-    async def _check_all_subscriptions(
-        self, flush_collected: bool = True
-    ):
-        """检查所有订阅的新推文（支持并发分组处理）
+    async def _check_all_subscriptions(self):
+        """检查所有订阅的新推文"""
+        subscribe_list = await self._get_subs()
+        if not subscribe_list:
+            logger.debug("轮询: 无订阅，跳过")
+            return
 
-        参数:
-            flush_collected: 是否在轮询结束后立即发送缓存的推文。
-                            定时推送模式下应设为 False，
-                            由 _scheduled_push_worker 在 send_time 后统一发送。
-        """
-        async with self._poll_lock:  # 防止并发轮询
-            subscribe_list = await self._get_subs()
-            if not subscribe_list:
-                logger.debug("轮询: 无订阅，跳过")
-                return
+        usernames = list(subscribe_list.keys())
+        logger.debug(
+            f"轮询开始: {len(usernames)} 个推主 "
+            f"({', '.join(f'@{u}' for u in usernames)})"
+        )
 
-            usernames = list(subscribe_list.keys())
-            thread_count = self.poll_thread_count
+        results: list[bool] = []
+        for username, info in subscribe_list.items():
+            try:
+                result = await self._check_user_tweets(username, info)
+                results.append(result)
+                await asyncio.sleep(3)  # 避免频繁请求
+            except Exception as e:
+                logger.error(f"检查 {username} 推文失败: {e}")
+                results.append(False)
 
-            # 如果推主数少于线程数，减少线程数以匹配
-            effective_threads = min(thread_count, len(usernames))
+        success_count = sum(1 for r in results if r)
+        logger.debug(
+            f"轮询结束: {success_count}/{len(results)} 个推主检查成功"
+        )
 
-            if effective_threads <= 1:
-                # 单线程模式（向后兼容）
-                logger.debug(
-                    f"轮询开始: {len(usernames)} 个推主（串行）"
-                )
-                results: list[bool] = []
-                for username, info in subscribe_list.items():
-                    try:
-                        result = await self._check_user_tweets(username, info)
-                        results.append(result)
-                        await asyncio.sleep(3)  # 避免频繁请求
-                    except Exception as e:
-                        logger.error(f"检查 {username} 推文失败: {e}")
-                        results.append(False)
-            else:
-                # 多线程并发模式
-                groups = self._split_into_groups(usernames, effective_threads)
-                logger.debug(
-                    f"轮询开始: {len(usernames)} 个推主, "
-                    f"{effective_threads} 线程并发, "
-                    f"每组 {[len(g) for g in groups]} 个推主"
-                )
-
-                async def _process_group(
-                    group_usernames: list[str],
-                ) -> list[bool]:
-                    """处理一组推主的推文（内部串行，外部并发）"""
-                    group_results: list[bool] = []
-                    for uname in group_usernames:
-                        info = subscribe_list[uname]
-                        try:
-                            result = await self._check_user_tweets(uname, info)
-                            group_results.append(result)
-                            # 每组内仍有 3 秒间隔，避免单 IP 触发限流
-                            await asyncio.sleep(3)
-                        except Exception as e:
-                            logger.error(
-                                f"检查 {uname} 推文失败: {e}"
-                            )
-                            group_results.append(False)
-                    return group_results
-
-                group_tasks = [_process_group(g) for g in groups]
-                all_group_results = await asyncio.gather(*group_tasks)
-                results = [
-                    r for grp in all_group_results for r in grp
-                ]
-
-            success_count = sum(1 for r in results if r)
-            logger.debug(
-                f"轮询结束: {success_count}/{len(results)} 个推主检查成功"
-            )
-
-            # 集体转发模式：轮询结束后统一发送缓存的推文
-            # 注意：定时推送模式下不在此处 flush，由 _scheduled_push_worker 延迟到
-            # send_time 之后再统一发送
-            if (
-                flush_collected
-                and self.collective_forward
-                and self._collected_tweets
-            ):
-                await self._flush_collected_tweets()
+        # 集体转发模式：轮询结束后统一发送缓存的推文
+        if self.collective_forward and self._collected_tweets:
+            await self._flush_collected_tweets()
 
     async def _check_user_tweets(self, username: str, info: dict) -> bool:
         """检查某个用户的新推文，使用 advanced_search + since_time 过滤。
@@ -2299,11 +1843,14 @@ class TwitterPlugin(Star):
             screen_name = str(tweet_info.get("screen_name") or author_username)
             nickname = self._build_author_display(author_username, screen_name)
             try:
-                nodes = self._split_chain_for_nodes(chain, nickname)
+                nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
                 if nodes:
                     yield event.chain_result([Nodes(nodes)])
                 else:
                     yield event.plain_result(f"未找到 @{username} 的推文内容")
+                # 视频无法通过 yield 发送，作为独立消息发送
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
             except Exception:
                 # 合并转发失败，回退到普通消息链
                 plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
@@ -2369,11 +1916,14 @@ class TwitterPlugin(Star):
                 screen_name = str(tweet_info.get("screen_name") or author_username)
                 nickname = self._build_author_display(author_username, screen_name)
                 try:
-                    nodes = self._split_chain_for_nodes(
+                    nodes, video_parts = self._split_chain_for_nodes(
                         chain, nickname
                     )
                     if nodes:
                         yield event.chain_result([Nodes(nodes)])
+                    # 视频无法通过 yield 发送，作为独立消息发送
+                    for vid_comp in video_parts:
+                        await self._send_video_or_fallback(umo, vid_comp)
                 except Exception:
                     plain_chain, video_parts = self._split_plain_chain_and_videos(
                         chain
